@@ -129,7 +129,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let cli = Cli::parse();
-    match cli.command {
+    let result = match cli.command {
         Command::Inspect {
             file,
             imports,
@@ -172,7 +172,9 @@ fn main() -> Result<()> {
             title_args: _,
         } => run::run(&exe, unimplemented, strict, execute, console),
         Command::Config => show_config(),
-    }
+    };
+    victory_core::logging::flush();
+    result
 }
 
 fn show_config() -> Result<()> {

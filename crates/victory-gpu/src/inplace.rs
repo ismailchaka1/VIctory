@@ -1099,6 +1099,7 @@ mod tests {
     /// driver is what a run with `VICTORY_INPLACE_PROBE=1` adds.
     #[test]
     fn warp_probe_opens_title_like_memory_and_the_gpu_sees_its_bytes() {
+        let _one_at_a_time = crate::WARP_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let Some(device) = warp() else { return };
         if device.cast::<ID3D12Device13>().is_err() {
             eprintln!("no ID3D12Device13 here: parts of an allocation cannot be opened");
@@ -1122,6 +1123,7 @@ mod tests {
     /// whole is turned down without asking the host.
     #[test]
     fn warp_a_title_buffer_in_place_shows_its_bytes_at_its_offset() {
+        let _one_at_a_time = crate::WARP_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let Some(device) = warp() else { return };
         if device.cast::<ID3D12Device13>().is_err() {
             return;

@@ -40,7 +40,7 @@ fn program(skip: u32) -> NativeProgram {
 
 /// A wave64 compute program of 64 threads (one console wave; the thread index in v0) with 4
 /// root constants in s0..s3 and a raw UAV's descriptor in s[8:11], then `body`.
-fn native(body: &[u32]) -> NativeProgram {
+pub(super) fn native(body: &[u32]) -> NativeProgram {
     native_of(body, true, 64)
 }
 
@@ -94,7 +94,7 @@ fn native_of(body: &[u32], wave64: bool, threads: u32) -> NativeProgram {
 }
 
 /// `program()` for a host of 32-lane waves, with the branches closing `wide` taken wave-wide.
-fn lowered(native: &NativeProgram, p: &ir::Program, wide: &HashSet<usize>) -> Result<HostShader, ShaderError> {
+pub(super) fn lowered(native: &NativeProgram, p: &ir::Program, wide: &HashSet<usize>) -> Result<HostShader, ShaderError> {
     let st = structure::structure_wide(p, wide).expect("structure");
     let res = resource::track(p, &native.layout, native.stage, Some(&st)).expect("resource::track");
     let io = io::raise(p, native).expect("io::raise");

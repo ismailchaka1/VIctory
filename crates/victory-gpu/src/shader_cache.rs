@@ -69,6 +69,8 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_WAVE_DEEP_SKIPS",
                     "VICTORY_WAVE_OWN_BITS",
                     "VICTORY_F16_NEAREST",
+                    // Index-picked textures note their heap slots.
+                    "VICTORY_SLOTS_READ",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());
                     bytes.push(b'=');

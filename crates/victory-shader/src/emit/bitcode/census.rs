@@ -51,6 +51,12 @@ thread_local! {
     static WRITTEN: RefCell<Vec<(usize, u64, Census)>> = const { RefCell::new(Vec::new()) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Counting for one test's thread, whatever `VICTORY_SHADER_CENSUS` says.
+    pub(crate) static COUNT_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn fnv(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
         (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
@@ -59,6 +65,10 @@ fn fnv(bytes: &[u8]) -> u64 {
 
 /// Whether modules are counted (`VICTORY_SHADER_CENSUS` set).
 pub fn enabled() -> bool {
+    #[cfg(test)]
+    if COUNT_IN_TEST.get() {
+        return true;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_SHADER_CENSUS").is_some())
 }
@@ -113,6 +123,40 @@ fn kind(name: &str) -> usize {
 }
 
 impl Module {
+    /// Calls of `dx.op.<name>*` whose element id (argument 1, a constant)
+    /// `map` sends to None are removed, the others take the new id.
+    pub(crate) fn remap_output_ids(&mut self, name: &str, map: &[Option<u32>]) {
+        let prefix = format!("dx.op.{name}");
+        let fs: Vec<u32> = (0..self.funcs.len() as u32).filter(|&f| self.funcs[f as usize].name.starts_with(&prefix)).collect();
+        for b in 0..self.blocks.len() {
+            let body = std::mem::take(&mut self.blocks[b].body);
+            let mut kept = Vec::with_capacity(body.len());
+            for i in body {
+                if let Op::Call(f, args) = &self.insts[i as usize].op
+                    && fs.contains(f)
+                    && let Some(old) = args.get(1).and_then(|&a| self.int_value(a))
+                {
+                    match map.get(old as usize).copied().flatten() {
+                        None => continue,
+                        Some(new) => {
+                            let v = self.i32(new);
+                            if let Op::Call(_, args) = &mut self.insts[i as usize].op {
+                                args[1] = v;
+                            }
+                        }
+                    }
+                }
+                kept.push(i);
+            }
+            self.blocks[b].body = kept;
+        }
+    }
+
+    /// Whether a declared function's name contains `part`.
+    pub(crate) fn declares(&self, part: &str) -> bool {
+        self.funcs.iter().any(|f| f.name.contains(part))
+    }
+
     /// The instructions [`Module::write`] writes, by kind.
     pub(crate) fn census(&self) -> Census {
         let k = |s: &str| KINDS.iter().position(|k| *k == s).expect("kind");

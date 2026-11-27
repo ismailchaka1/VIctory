@@ -113,10 +113,48 @@ pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    MEMORY_FAULTS, MEMORY_PAGES, MEMORY_TOUCHED, MEMORY_WRITTEN, ROOT_CBV_SPACE, SLOTS_READ, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_READS, SLOT_STRIDES,
+    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS, USER_GROUP_BASE,
     set_view_heap_limit, view_heap_limit,
 };
+
+/// Whether translated programs note the view-heap slots their index-picked
+/// textures name ([`SLOTS_READ`] in the [`SLOT_READS`] buffer).
+/// On by default (run t1-13: host textures 8.2 -> 3.8 GB, no fps loss);
+/// `VICTORY_SLOTS_READ=0` turns it off. Tests default to off. Part of the
+/// translation: the shader cache keys on it (`victory-gpu`'s does).
+pub fn slots_read() -> bool {
+    #[cfg(test)]
+    return SLOTS_READ_TEST.get().unwrap_or(false);
+    #[cfg(not(test))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("VICTORY_SLOTS_READ").map_or(true, |v| v.trim() != "0"))
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's own [`slots_read`] (tests run on threads of their own).
+    pub(crate) static SLOTS_READ_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    /// [`translate_keeping`]'s outputs, while it runs.
+    pub(crate) static KEEP_OUTPUTS: std::cell::RefCell<Option<Vec<(String, u32)>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// As [`translate`], for a mesh shader whose vertex outputs pass D3D12's
+/// 32 KiB: the outputs not named in `keep` (semantic name, index: what the
+/// pixel shader it is drawn with reads) are left out, system values
+/// excepted. Meshes 72da0ba1, 8a621a22 declare 66-68 values per vertex for
+/// 128 vertices; their pixel shaders read 61 of them.
+pub fn translate_keeping(container: &[u8], keep: &[(String, u32)]) -> Result<HostShader, ShaderError> {
+    KEEP_OUTPUTS.with(|k| *k.borrow_mut() = Some(keep.to_vec()));
+    let r = translate(container);
+    KEEP_OUTPUTS.with(|k| *k.borrow_mut() = None);
+    r
+}
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -270,8 +308,13 @@ pub struct UserData {
 
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
+///
+/// A container followed by [`TAIL`] and `threads` (a little-endian u32) is the compute program
+/// as the partial last group of a dispatch counted in threads: `threads` threads in x, run as a
+/// dispatch of one group of its own whose x group is the host's [`USER_GROUP_BASE`].
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
+    let tail = tail_of(container);
     let dxil = c
         .part(FourCC::DXIL)
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
@@ -287,6 +330,15 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
+    let mut native = native;
+    if let Some(threads) = tail {
+        match &mut native.io {
+            crate::native::StageIo::Cs(cs) if threads > 0 && threads < cs.threads[0] && cs.threads[1] * cs.threads[2] == 1 => {
+                cs.threads[0] = threads;
+            }
+            _ => return Err(ShaderError::Malformed("a tail of a program that is not a 1-D compute program")),
+        }
+    }
     let p = crate::spill::build(&native)?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
@@ -294,7 +346,20 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
-    emit(&c, &native, &p, &st, &io, &res)
+    let was = lower::TAIL.replace(tail.is_some());
+    let r = emit(&c, &native, &p, &st, &io, &res);
+    lower::TAIL.set(was);
+    r
+}
+
+/// The marker after a container that makes it a tail (see [`translate`]).
+pub const TAIL: [u8; 4] = *b"VTAL";
+
+/// A container's tail suffix: its threads.
+fn tail_of(bytes: &[u8]) -> Option<u32> {
+    let total = u32::from_le_bytes(bytes.get(0x18..0x1C)?.try_into().ok()?) as usize;
+    let rest = bytes.get(total..)?;
+    (rest.len() == 8 && rest[..4] == TAIL).then(|| u32::from_le_bytes(rest[4..8].try_into().unwrap()))
 }
 
 /// Emits a program whose earlier stages already ran.
@@ -460,6 +525,13 @@ pub fn emit(
                     return local.map(|(shader, _)| shader);
                 }
             }
+        }
+        // Last: one host wave per console wave, two console lanes per thread
+        // (`lower::with_paired_lanes`): exact, with no barriers between halves.
+        let paired = lower::with_paired_lanes(|| emit_program(c, native, p, st, io, res));
+        report("paired lanes", &paired);
+        if done(&paired) {
+            return paired.map(|(shader, _)| shader);
         }
     }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
@@ -1740,4 +1812,31 @@ mod barycentric_tests {
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
     }
+}
+
+/// The inputs a pixel shader reads (semantic name, index): its `ISG1` rows
+/// whose read mask is not empty. For [`super::translate_keeping`].
+pub fn pixel_reads(ps_dxil: &[u8]) -> Vec<(String, u32)> {
+    let Ok(c) = Container::parse(ps_dxil) else { return Vec::new() };
+    let Some(p) = c.part(FourCC::ISG1) else { return Vec::new() };
+    let d = p.data;
+    let word = |at: usize| d.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+    let (Some(n), Some(base)) = (word(0), word(4)) else { return Vec::new() };
+    (0..n as usize)
+        .filter_map(|i| {
+            let at = base as usize + 32 * i;
+            let (name_at, index, read) = (word(at + 4)? as usize, word(at + 8)?, *d.get(at + 25)?);
+            let name = d.get(name_at..)?.split(|&b| b == 0).next()?;
+            (read != 0).then(|| (String::from_utf8_lossy(name).into_owned(), index))
+        })
+        .collect()
+}
+
+/// Whether a translated mesh shader declares more than 64 output values per
+/// vertex and primitive together: at 128 of each, past D3D12's 32 KiB.
+pub fn mesh_outputs_wide(ms_dxil: &[u8]) -> bool {
+    let scalars = |f| {
+        Container::parse(ms_dxil).ok().and_then(|c| c.part(f).and_then(|p| signature(p.data).ok())).map_or(0, |els| els.iter().map(|e| u32::from(e.cols)).sum::<u32>())
+    };
+    scalars(FourCC::OSG1) + scalars(FourCC::PSG1) > 64
 }

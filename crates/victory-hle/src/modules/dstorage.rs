@@ -24,6 +24,7 @@ use std::os::windows::fs::FileExt;
 use std::os::windows::io::FromRawHandle;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
 
 use victory_formats::bcpack::{self, Tables};
 
@@ -144,7 +145,7 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
+    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file, last_end: AtomicU64::new(u64::MAX) });
     put(out, file)
 }
 
@@ -258,7 +259,13 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 
 struct File {
     file: std::fs::File,
+    /// Where the last read of this file ended (read statistics).
+    last_end: AtomicU64,
 }
+
+/// Since the last statistics line: reads, bytes, reads that began where
+/// the file's last read ended, reads of 256 KiB or more.
+static READS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 static FILE_VTABLE: Methods<8> = Methods([
     missing::<0> as *const (),
@@ -485,6 +492,21 @@ impl Lanes {
                 staging_waits = std::mem::take(&mut self.refused),
                 bcpack_mb = self.bcpack.0 / 1_000_000,
                 bcpack_workers = format_args!("{:.2}", self.bcpack.1.as_secs_f64() / elapsed.as_secs_f64()),
+                read_decode_write_workers = format_args!(
+                    "{:.2}/{:.2}/{:.2}",
+                    SPLIT[0].swap(0, Ordering::Relaxed) as f64 / 1e9 / elapsed.as_secs_f64(),
+                    SPLIT[1].swap(0, Ordering::Relaxed) as f64 / 1e9 / elapsed.as_secs_f64(),
+                    SPLIT[2].swap(0, Ordering::Relaxed) as f64 / 1e9 / elapsed.as_secs_f64()
+                ),
+                reads_mb_adjacent_big = {
+                    let [n, b, a, g] = READS.each_ref().map(|r| r.swap(0, Ordering::Relaxed));
+                    format!("{n}/{}/{a}/{g}", b >> 20)
+                },
+                table_map_unmap_workers = {
+                    let [t, m, u] = super::xmem::take_write_times();
+                    let e = elapsed.as_secs_f64();
+                    format!("{:.2}/{:.2}/{:.2}", t / e, m / e, u / e)
+                },
                 waiting,
                 "dstorage: last {:.1} s",
                 elapsed.as_secs_f64()
@@ -784,6 +806,15 @@ extern "system" fn close(this: QueueRef) {
     close_lane(unsafe { &*this }.state.id);
 }
 
+/// Worker time since the last statistics line, in nanoseconds: reading
+/// sources, inflating and unpacking, and writing destinations (with what
+/// that waits for).
+static SPLIT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+fn split(k: usize, d: Duration) {
+    SPLIT[k].fetch_add(d.as_nanos() as u64, Ordering::Relaxed);
+}
+
 /// Reads, inflates and/or unpacks, and writes one request.
 fn execute(request: &Request) -> Result<(), HRESULT> {
     let options = request.options;
@@ -814,11 +845,23 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             return Err(fail(E_INVALIDARG, "source larger than destination"));
         }
         let size = request.source_size as usize;
-        return into_destination(request, size, |out| read_into(request, out).map(|()| size))
-            .map_err(|hr| fail(hr, "copying"));
+        let began = Instant::now();
+        let mut inner = Duration::ZERO;
+        let done = into_destination(request, size, |out| {
+            let at = Instant::now();
+            let r = read_into(request, out).map(|()| size);
+            inner = at.elapsed();
+            r
+        });
+        split(0, inner);
+        split(2, began.elapsed().saturating_sub(inner));
+        return done.map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
+    let began = Instant::now();
     let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
+    split(0, began.elapsed());
+    let began = Instant::now();
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
         let mut packed = vec![0; request.intermediate_size as usize];
@@ -828,12 +871,23 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     } else {
         source
     };
-    into_destination(request, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, &source, out, tables)
-            .map(|()| out.len())
-            .map_err(|e| fail(INVALID_DATA, &e.to_string())),
-        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
-    })?;
+    split(1, began.elapsed());
+    let began = Instant::now();
+    let mut inner = Duration::ZERO;
+    let done = into_destination(request, size, |out| {
+        let at = Instant::now();
+        let r = match tables {
+            Some(tables) => bcpack::decode(bc, &source, out, tables)
+                .map(|()| out.len())
+                .map_err(|e| fail(INVALID_DATA, &e.to_string())),
+            None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
+        };
+        inner = at.elapsed();
+        r
+    });
+    split(1, inner);
+    split(2, began.elapsed().saturating_sub(inner));
+    done?;
     tracing::trace!(
         options = format_args!("{options:#x}"),
         offset = request.offset,
@@ -955,9 +1009,13 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         return Ok(());
     }
     // SAFETY: a file object we created; the title keeps it open.
-    let file = &unsafe { &*request.source.cast::<Instance<File>>() }
-        .state
-        .file;
+    let state = &unsafe { &*request.source.cast::<Instance<File>>() }.state;
+    let file = &state.file;
+    let end = request.offset + out.len() as u64;
+    let adjacent = state.last_end.swap(end, Ordering::Relaxed) == request.offset;
+    for (k, add) in [1, out.len() as u64, u64::from(adjacent), u64::from(out.len() >= 256 << 10)].into_iter().enumerate() {
+        READS[k].fetch_add(add, Ordering::Relaxed);
+    }
     let started = std::time::Instant::now();
     let mut done = 0;
     let result = loop {
@@ -982,16 +1040,15 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
 fn into_destination(
     request: &Request,
     len: usize,
-    fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
+    mut fill: impl FnMut(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
     if request.options & PAGE_DESTINATION == 0 {
-        // Raw reads land through the kernel, which does not fault into the
-        // GPU side's guard on title buffers; open them first.
-        victory_gpu::kernel_will_write(request.destination as usize, len);
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
-        return fill(out).map(drop);
+        let done = fill_opened(request.destination as usize, out, fill);
+        written_at(request.destination as usize, len);
+        return done;
     }
     let offset = (request.page_offset & 0xffff) as usize;
     // SAFETY: the title passes a page number per 64 KiB of destination,
@@ -1002,10 +1059,20 @@ fn into_destination(
             (offset + len).div_ceil(PAGE),
         )
     };
+    // Every address of these pages: guards opened before the write (with
+    // `VICTORY_ALIAS_GUARDS=1` a write into a still-protected page failed
+    // the request, run t1-5).
+    if super::xmem::alias_guards() {
+        for at in super::xmem::addresses_of_pages(pages, offset, len) {
+            victory_gpu::kernel_will_write(at, PAGE);
+        }
+    }
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
-        return fill(window.bytes()).map(drop);
+        let done = fill(window.bytes()).map(drop);
+        written_elsewhere(pages, offset, len);
+        return done;
     }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
@@ -1025,6 +1092,7 @@ fn into_destination(
         written = super::xmem::write_physical(pages, offset, &data[..n]);
     }
     if written {
+        written_elsewhere(pages, offset, len);
         if tries > 0 {
             tracing::info!(offset, len, tries, "dstorage: a destination's physical pages written after a retry");
         }
@@ -1043,6 +1111,84 @@ fn into_destination(
             "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
         );
         Err(E_INVALIDARG)
+    }
+}
+
+/// Physical pages were written through a view of ours: every address that
+/// shows them counts as written for the GPU side's copies (the title
+/// streams its prebuilt ray-tracing structures this way, and reads them
+/// through other addresses).
+fn written_elsewhere(pages: &[usize], offset: usize, len: usize) {
+    let guards = super::xmem::alias_guards();
+    for at in super::xmem::addresses_of_pages(pages, offset, len) {
+        if guards {
+            victory_gpu::title_memory_written_elsewhere(at, PAGE);
+        } else if tell() {
+            // Textures placed under any address of these pages are due again (census A5).
+            victory_gpu::texture_memory_written(at, PAGE);
+        }
+    }
+}
+
+/// Raw reads land through the kernel, which does not fault into the GPU
+/// side's guards; they are opened first. A guard put back meanwhile (by
+/// another thread, before the read) fails the read with
+/// ERROR_INVALID_USER_BUFFER (run t1-22) or ERROR_NOACCESS (track5-18): opened again and read again.
+/// `fill` may then run more than once; it reads the whole source each time.
+fn fill_opened(at: usize, out: &mut [u8], mut fill: impl FnMut(&mut [u8]) -> Result<usize, HRESULT>) -> Result<(), HRESULT> {
+    const INVALID_USER_BUFFER: HRESULT = 0x8007_06f8_u32 as HRESULT;
+    // The same guard coming back, as the kernel tells it for some reads (track5-18: a failed
+    // request, then the title's int3 at +0x23d8f03 for the resource it never got).
+    const NOACCESS: HRESULT = 0x8007_03e6_u32 as HRESULT;
+    let len = out.len();
+    let mut tries = 0;
+    loop {
+        victory_gpu::kernel_will_write(at, len);
+        open_aliases(at, len);
+        match fill(out) {
+            Err(hr) if (hr == INVALID_USER_BUFFER || hr == NOACCESS) && tries < 4 => tries += 1,
+            r => {
+                if tries > 0 {
+                    tracing::info!(tries, ok = r.is_ok(), "dstorage: a raw destination read again after a guard came back");
+                }
+                return r.map(drop);
+            }
+        }
+    }
+}
+
+/// With `VICTORY_ALIAS_GUARDS=1`: the guards of the other addresses of a
+/// raw destination's pages are opened before it is written.
+fn open_aliases(at: usize, len: usize) {
+    if !super::xmem::alias_guards() {
+        return;
+    }
+    for page in ((at & !(PAGE - 1))..at + len).step_by(PAGE) {
+        for other in super::xmem::other_addresses(page) {
+            victory_gpu::kernel_will_write(other, PAGE);
+        }
+    }
+}
+
+/// `VICTORY_DSTORAGE_TELL=0` keeps finished requests from making the
+/// textures over them due again (to measure census A5 without it).
+fn tell() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DSTORAGE_TELL").is_none_or(|v| v != "0"))
+}
+
+/// A raw destination `[at, at + len)` was written: textures placed there,
+/// or at another address of the same physical pages, are due again.
+fn written_at(at: usize, len: usize) {
+    if !tell() {
+        return;
+    }
+    victory_gpu::texture_memory_written(at, len);
+    let first = at & !(PAGE - 1);
+    for page in (first..at + len).step_by(PAGE) {
+        for other in super::xmem::other_addresses(page) {
+            victory_gpu::texture_memory_written(other, PAGE);
+        }
     }
 }
 

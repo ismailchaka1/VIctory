@@ -17,6 +17,65 @@ use windows::core::PCSTR;
 use super::{Shader, Translated};
 use crate::host::host;
 
+impl GraphicsState {
+    /// The blend state for the host: blending and logic ops off for targets
+    /// of an integer format, which D3D12 refuses to blend (the console
+    /// ignores it there: mesh f5e50eb2 + pixel ce3f0432 blend into an
+    /// R8_UINT target 2, refused with E_INVALIDARG, run track3-4).
+    pub(crate) fn host_blend(&self) -> D3D12_BLEND_DESC {
+        host_blend(&self.blend, &self.targets)
+    }
+}
+
+fn host_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D12_BLEND_DESC {
+    let mut b = *blend;
+    let n = (targets.NumRenderTargets as usize).min(8);
+    let integer = |i: usize| is_integer(targets.RTFormats[i]);
+    if !(0..n).any(integer) {
+        return b;
+    }
+    if !b.IndependentBlendEnable.as_bool() {
+        // Target 0's state is every target's: written out per target first.
+        b.IndependentBlendEnable = true.into();
+        b.RenderTarget = [b.RenderTarget[0]; 8];
+    }
+    for i in (0..n).filter(|&i| integer(i)) {
+        b.RenderTarget[i].BlendEnable = false.into();
+        b.RenderTarget[i].LogicOpEnable = false.into();
+    }
+    b
+}
+
+fn is_integer(f: DXGI_FORMAT) -> bool {
+    [
+        DXGI_FORMAT_R32G32B32A32_UINT, DXGI_FORMAT_R32G32B32A32_SINT, DXGI_FORMAT_R32G32B32_UINT, DXGI_FORMAT_R32G32B32_SINT,
+        DXGI_FORMAT_R16G16B16A16_UINT, DXGI_FORMAT_R16G16B16A16_SINT, DXGI_FORMAT_R32G32_UINT, DXGI_FORMAT_R32G32_SINT,
+        DXGI_FORMAT_R10G10B10A2_UINT, DXGI_FORMAT_R8G8B8A8_UINT, DXGI_FORMAT_R8G8B8A8_SINT, DXGI_FORMAT_R16G16_UINT,
+        DXGI_FORMAT_R16G16_SINT, DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32_SINT, DXGI_FORMAT_R8G8_UINT, DXGI_FORMAT_R8G8_SINT,
+        DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R16_SINT, DXGI_FORMAT_R8_UINT, DXGI_FORMAT_R8_SINT,
+    ]
+    .contains(&f)
+}
+
+#[cfg(test)]
+mod blend_tests {
+    use super::*;
+
+    #[test]
+    fn integer_targets_do_not_blend() {
+        let mut blend = D3D12_BLEND_DESC::default();
+        blend.RenderTarget[0].BlendEnable = true.into();
+        let mut targets = D3D12_RT_FORMAT_ARRAY { NumRenderTargets: 3, ..Default::default() };
+        targets.RTFormats[..3].copy_from_slice(&[DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R8_UINT]);
+        let b = host_blend(&blend, &targets);
+        assert!(b.IndependentBlendEnable.as_bool());
+        assert!(b.RenderTarget[0].BlendEnable.as_bool() && b.RenderTarget[1].BlendEnable.as_bool());
+        assert!(!b.RenderTarget[2].BlendEnable.as_bool());
+        targets.RTFormats[2] = DXGI_FORMAT_R8_UNORM;
+        assert!(!host_blend(&blend, &targets).IndependentBlendEnable.as_bool(), "no integer target: as given");
+    }
+}
+
 /// A stream's graphics state, owned (the title's stream lives only for the
 /// creation call). Subobjects the stream leaves out keep D3D12's defaults.
 pub(crate) struct GraphicsState {
@@ -195,7 +254,11 @@ impl GraphicsState {
         };
         format!(
             "{:?} {} {:?} {:?}{bounds} {inputs:?} {} {} {:?} {} {:?}",
-            self.blend,
+            // The blend state the host pipeline is made with: the library
+            // names pipelines by this text, and the title's own blend state
+            // here left 255 pipelines a run (track3-8) stored before
+            // `host_blend` under names that no longer match their description.
+            self.host_blend(),
             self.sample_mask,
             self.rasterizer,
             self.depth,
@@ -432,7 +495,7 @@ impl HostPipeline {
                     // table of strides, the directory of title memory by
                     // address and its fault notes.
                     let ours = if uav {
-                        slot == victory_shader::emit::SLOT_FAULTS
+                        slot == victory_shader::emit::SLOT_FAULTS || slot == victory_shader::emit::SLOT_READS
                     } else {
                         slot == victory_shader::emit::SLOT_STRIDES
                             || slot == victory_shader::emit::SLOT_MEMORY
@@ -576,6 +639,37 @@ impl HostPipeline {
         };
         let state = g.describe();
         if mesh.is_some() {
+            // A mesh shader whose outputs pass 32 KiB: translated again with
+            // only the outputs this pipeline's pixel shader reads (meshes
+            // 72da0ba1, 8a621a22).
+            let trimmed = (|| {
+                let ms = stages.first()?.0;
+                let ps = stages.get(1)?.0.translated()?;
+                if !victory_shader::emit::mesh_outputs_wide(&ms.translated()?.host.dxil) {
+                    return None;
+                }
+                let keep = victory_shader::emit::pixel_reads(&ps.host.dxil);
+                // Both: the pixel shader's unread inputs go with the outputs.
+                let ps_shader = stages.get(1)?.0;
+                match (
+                    victory_shader::emit::translate_keeping(&ms.container, &keep),
+                    victory_shader::emit::translate_keeping(&ps_shader.container, &keep),
+                ) {
+                    (Ok(m), Ok(p)) => {
+                        tracing::info!(?shaders, kept = keep.len(), "a mesh shader's outputs past 32 KiB: translated again with those its pixel shader reads");
+                        Some((m.dxil, p.dxil))
+                    }
+                    (m, p) => {
+                        tracing::warn!(mesh = ?m.err(), pixel = ?p.err(), ?shaders, "a mesh shader translated again with fewer outputs did not translate");
+                        None
+                    }
+                }
+            })();
+            let bytes = |d: &Vec<u8>| D3D12_SHADER_BYTECODE { pShaderBytecode: d.as_ptr().cast(), BytecodeLength: d.len() };
+            let (ms_code, ps_code) = match &trimmed {
+                Some((m, p)) => (bytes(m), bytes(p)),
+                None => (code(0), code(1)),
+            };
             // "triangles": the stream names its topology since it did not
             // load from the library without one (see `mesh_pipeline`); a
             // new name keeps such entries, stored before, from being
@@ -583,10 +677,10 @@ impl HostPipeline {
             let name = super::library::name(
                 "mesh triangles",
                 &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1))],
+                &[&code_bytes(&ms_code), &code_bytes(&ps_code)],
                 &state,
             );
-            let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, depth_bounds, &name) {
+            let pso = match mesh_pipeline(&host.device, &root, ms_code, ps_code, g, depth_bounds, &name) {
                 Ok(pso) => pso,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
@@ -634,7 +728,7 @@ impl HostPipeline {
                     BytecodeLength: gs.len(),
                 }
             }),
-            BlendState: g.blend,
+            BlendState: g.host_blend(),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
@@ -881,7 +975,7 @@ fn mesh_pipeline(
             root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.host_blend()),
             mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
             raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
             depth,
@@ -900,7 +994,7 @@ fn mesh_pipeline(
             root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.host_blend()),
             mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
             raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
             depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, g.depth1()),

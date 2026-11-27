@@ -63,9 +63,16 @@ shaders and emulates the one instruction.
 
 ## Known gaps
 
-- With `VICTORY_BVH_BUILDER=1` the builder still stays off in a real run: a few
-  of its pipelines are refused by the host (they still ask for 64-lane waves on
-  a 32-lane GPU) or do not translate.
+- Since the paired-lane wave64 mode, every builder pipeline is made and
+  `VICTORY_BVH_BUILDER=1` turns the builder on in a real run. The title then
+  crashes about 4 seconds after the builder's first dispatch, on a pointer that
+  holds a float's bit pattern; with `VICTORY_BVH_QUARANTINE=1` too, it crashes
+  as fast on a null pointer. So the title's CPU reads the builder's results
+  (the builder's interface is shaped like the PC's: post-build information
+  such as compacted sizes) and they are wrong, not only stray stores.
+  `VICTORY_BVH_QUARANTINE` also takes a comma-separated list of shader hashes
+  (each builder pipeline is logged with its hash when made), to quarantine
+  some stages only.
 - Five shadow-mask trace programs do not translate yet.
 - An access to a title page that has no host copy is lost (a read gives zero, a
   store is dropped).

@@ -19,6 +19,15 @@ extern "system" fn create_device(
 ) -> HRESULT {
     victory_gpu::resource::use_allocator(super::xmem::XMemAlloc, super::xmem::XMemFree);
     victory_gpu::resource::use_page_mapper(super::xmem::map_alias);
+    // `VICTORY_ALIAS_GUARDS=1`: writes through one address of physical
+    // memory count for its other addresses' copies (off: did not end the
+    // ray-tracing builder's crash, run vis-35; cost not measured).
+    if super::xmem::alias_guards() {
+        victory_gpu::use_alias_finder(super::xmem::other_addresses);
+    }
+    // Census A5: `victory_gpu::use_other_addresses(super::xmem::other_addresses)`
+    // tripled the textures found changed after upload (run t1-18: 2306 vs
+    // 737), so it is not registered; see the track 1 notes.
     #[cfg(windows)]
     victory_gpu::on_failure(host_gpu_failed);
     device::create(adapter, parameters, iid, out)

@@ -407,6 +407,8 @@ pub(crate) fn release_held(all: bool) {
                     // for, if anything was.
                     Held::Signal(fence, value) => {
                         if !crate::host::late_signal(fence, value) {
+                            #[cfg(feature = "diagnostics")]
+                            crate::host::note_fence_set();
                             crate::fence::set(fence as This, value);
                         }
                     }
@@ -591,6 +593,11 @@ pub(crate) struct Plane {
     token: u64,
     count: u32,
     resources: *const This,
+    _source_rects: *const u8,
+    _placement: *const u8,
+    /// The DXGI colour space the title says the plane is in (as the PC
+    /// API's plane parameters; logged when it changes, not yet used).
+    color_space: u32,
 }
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
@@ -626,6 +633,8 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
         return S_OK;
     }
     let _ = this;
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::host::note_fence_set();
     crate::fence::signal(fence, value)
 }
 /// From here on the queue runs nothing it is given until `fence` reaches
@@ -825,6 +834,10 @@ extern "system" fn present(
         && let Some(texture) = crate::resource::host_resource(resource)
         && let Some(host) = crate::host::host()
     {
+        static SPACE: AtomicU64 = AtomicU64::new(u64::MAX);
+        if SPACE.swap(plane.color_space.into(), Ordering::Relaxed) != u64::from(plane.color_space) {
+            tracing::info!(frame, color_space = plane.color_space, "the title presents in colour space");
+        }
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);

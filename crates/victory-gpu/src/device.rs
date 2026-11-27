@@ -354,7 +354,10 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
 /// fail as they always did, with `out` null, and the first ones log the
 /// description's words and what its first word points at, so that the two
 /// methods can be written.
-/// shortcut: not implemented. Answering `S_OK` here without making the
+/// After a failed 0x218 call the title makes the same compute pipeline the
+/// usual way (run track3-2: the shader hash each call names arrives in a
+/// container ~65 ms later), so 0x218 costs nothing on screen.
+/// shortcut: neither is implemented. Answering `S_OK` without making the
 /// pipeline would hand the title whatever its stack held as an object.
 extern "system" fn unknown_pipeline<const SLOT: usize>(
     _: This,
@@ -396,7 +399,55 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
             "a pipeline creation method that is not implemented: the title goes without this pipeline"
         );
     }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    dump_pieces(SLOT, calls, desc);
     E_NOTIMPL
+}
+
+/// `VICTORY_PIPELINE_DUMP=<dir>` (diagnostics): the description of each
+/// call of [`unknown_pipeline`] (0x200 bytes), and what each of its first
+/// 64 words points at: exactly the next word's bytes when that looks like a
+/// length, else up to 0x400. Words above 2^48 are taken for hashes and
+/// looked for in every shader container ([`pipeline::probe_hashes`]).
+#[cfg(all(windows, feature = "diagnostics"))]
+fn dump_pieces(slot: usize, calls: u32, desc: *const u8) {
+    static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    let Some(dir) = DIR.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_DUMP").map(Into::into)) else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(dir);
+    let read = |at: u64, len: usize| -> Option<Vec<u8>> {
+        let mut b = vec![0u8; len];
+        (at > 0x10000 && crate::host::read_into(at as *const u8, &mut b)).then_some(b)
+    };
+    let stem = format!("{slot:x}-{calls:03}");
+    let Some(d) = read(desc as u64, 0x200) else { return };
+    let _ = std::fs::write(dir.join(format!("{stem}.desc")), &d);
+    let words: Vec<u64> = d.as_chunks::<8>().0.iter().map(|c| u64::from_le_bytes(*c)).collect();
+    let mut hashes = Vec::new();
+    for i in 0..63 {
+        let (w, next) = (words[i], words[i + 1]);
+        if w >= 1 << 48 {
+            hashes.push(w);
+            continue;
+        }
+        let exact = (1..0x10_0000).contains(&next).then(|| read(w, next as usize)).flatten();
+        if let Some(b) = exact {
+            // A record of type 0x43 holds the 16-byte shader hash, as the
+            // XDAT 0x10 blob of a container does.
+            for (at, w) in b.as_chunks::<4>().0.iter().enumerate() {
+                if u32::from_le_bytes(*w) == 0x43
+                    && let Some(h) = b.get(4 * at + 4..4 * at + 12)
+                {
+                    hashes.push(u64::from_le_bytes(h.try_into().unwrap_or_default()));
+                }
+            }
+            let _ = std::fs::write(dir.join(format!("{stem}-w{i:02}-len.bin")), b);
+        } else if let Some(b) = [0x400, 0x100, 0x40].into_iter().find_map(|n| read(w, n)) {
+            let _ = std::fs::write(dir.join(format!("{stem}-w{i:02}.bin")), b);
+        }
+    }
+    pipeline::probe_hashes(slot, calls, &hashes);
 }
 
 /// IUnknown 3, object methods 4, device methods 76 (0x18-0x290), then the

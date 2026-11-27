@@ -47,6 +47,8 @@ pub use prepare::{PrepareError, PreparedImage, prepare};
 pub use resolve::{ImportResolver, Provenance, Resolution};
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use stacks::{dump_stacks, dump_stacks_on_schedule};
+/// Waits until every log line so far is written (before the process ends).
+pub use victory_core::logging::flush as flush_logs;
 #[cfg(windows)]
 pub use threads::disable_thread_calls;
 #[cfg(windows)]

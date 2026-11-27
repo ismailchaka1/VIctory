@@ -64,6 +64,7 @@ pub fn log_crashes_to(file: std::path::PathBuf) {
 /// Appends a failure that is not an exception (the host GPU's) to the crash
 /// log, with the title's last debug output, and prints it.
 pub fn log_crash(text: &str) {
+    victory_core::logging::flush();
     let text = format!("{text}
 {}", title_output());
     eprint!("{text}");
@@ -506,8 +507,35 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
         context.R14,
         context.R15
     ));
+    // What the pointer registers point at (the title's own structures: a
+    // wrong value read out of one names the object it came from).
+    for (name, value) in [("rbx", context.Rbx), ("rsi", context.Rsi), ("rdi", context.Rdi), ("r12", context.R12)] {
+        if let Some(words) = qwords_at(value as usize) {
+            line(format!("  [{name}] {:#x} {:#x} {:#x} {:#x}", words[0], words[1], words[2], words[3]));
+        }
+    }
     for (i, pc) in unwind(*context).into_iter().enumerate() {
         line(format!("  #{i:<2} {}", locate(pc as usize)));
+    }
+    // `VICTORY_CRASH_PEEK=<address>:<qwords>[,...]`: title memory at the unhandled one (a
+    // table the title's own checks read), with the performance counter and its frequency then
+    if to_file && let Ok(spec) = std::env::var("VICTORY_CRASH_PEEK") {
+        let (mut now, mut freq) = (0i64, 0i64);
+        // SAFETY: valid out pointers.
+        unsafe {
+            windows_sys::Win32::System::Performance::QueryPerformanceCounter(&mut now);
+            windows_sys::Win32::System::Performance::QueryPerformanceFrequency(&mut freq);
+        }
+        line(format!("  counter {now:#x} frequency {freq}"));
+        for part in spec.split(',') {
+            let Some((a, n)) = part.split_once(':') else { continue };
+            let (Ok(a), Ok(n)) = (usize::from_str_radix(a.trim_start_matches("0x"), 16), n.parse::<usize>()) else { continue };
+            for k in (0..n).step_by(4) {
+                if let Some(w) = qwords_at(a + k * 8) {
+                    line(format!("  peek {:#x}: {:#x} {:#x} {:#x} {:#x}", a + k * 8, w[0], w[1], w[2], w[3]));
+                }
+            }
+        }
     }
     if to_file {
         let said = title_output();
@@ -614,6 +642,24 @@ fn module_of(address: usize) -> Option<String> {
     let path = String::from_utf16_lossy(&path[..len as usize]);
     let name = path.rsplit('\\').next().unwrap_or(&path);
     Some(format!("{name}+{:#x}", address - module as usize))
+}
+
+/// The four qwords at `address` if they lie in one committed, readable,
+/// non-guard page.
+fn qwords_at(address: usize) -> Option<[u64; 4]> {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery};
+    if address < 0x10000 || address % 8 != 0 || (address & 0xfff) > 0x1000 - 32 {
+        return None;
+    }
+    // SAFETY: a zeroed MEMORY_BASIC_INFORMATION is valid.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: reads the address space's bookkeeping, not `address` itself.
+    let n = unsafe { VirtualQuery(address as *const _, &mut info, size_of_val(&info)) };
+    if n == 0 || info.State != MEM_COMMIT || info.Protect & (PAGE_GUARD | PAGE_NOACCESS) != 0 || info.Protect == 0 {
+        return None;
+    }
+    // SAFETY: 32 bytes inside one committed readable page.
+    Some(unsafe { (address as *const [u64; 4]).read_volatile() })
 }
 
 /// What is at `address`, for an access violation there: nothing, memory

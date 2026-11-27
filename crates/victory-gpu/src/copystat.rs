@@ -127,6 +127,10 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// Fences set when the title asked (not behind the line) while a
+    /// submission started earlier had not landed (S1; logged with the
+    /// clobbers).
+    EarlyFences,
 }
 const COUNTERS: usize = 80;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
@@ -253,6 +257,62 @@ pub(crate) fn compared(src: usize, len: usize, written: usize) {
     let e = map.get_or_insert_with(HashMap::new).entry((src, len)).or_insert((0, 0));
     e.0 += 1;
     e.1 += written as u64;
+}
+
+/// Copy-back merges that put the card's bytes over bytes title memory
+/// changed since the reference was taken (S1): pieces, bytes, bytes by
+/// why title memory differs (the journal says the title wrote the page
+/// since the copy took it / says it did not / cannot say; another host
+/// copy holds the address), and bytes per 64 KiB of title memory.
+#[derive(Default)]
+struct Clobbers {
+    pieces: u64,
+    bytes: u64,
+    by_cause: [u64; 3],
+    other_copy: u64,
+    at: HashMap<usize, u64>,
+}
+static CLOBBERS: Mutex<Option<Clobbers>> = Mutex::new(None);
+
+/// `bytes` bytes at `address` were clobbered; `title_wrote` as the
+/// write-watch journal tells it, `others` other host copies hold the address.
+pub(crate) fn clobber(address: usize, bytes: usize, title_wrote: Option<bool>, others: usize) {
+    let mut c = CLOBBERS.lock().unwrap_or_else(|e| e.into_inner());
+    let c = c.get_or_insert_with(Clobbers::default);
+    let n = bytes as u64;
+    c.pieces += 1;
+    c.bytes += n;
+    c.by_cause[match title_wrote {
+        Some(true) => 0,
+        Some(false) => 1,
+        None => 2,
+    }] += n;
+    if others > 0 {
+        c.other_copy += n;
+    }
+    *c.at.entry(address & !0xffff).or_default() += n;
+}
+
+/// The clobber census line (always logged, zero included: the S1 counter).
+fn log_clobbers(frames: f64, early_fences: f64) {
+    let c = CLOBBERS.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+    let mut at: Vec<(usize, u64)> = c.at.into_iter().collect();
+    at.sort_by_key(|&(a, n)| (std::cmp::Reverse(n), a));
+    let top: Vec<String> = at.iter().take(4).map(|(a, n)| format!("{a:#x} {n}")).collect();
+    let per = |v: u64| v as f64 / frames;
+    tracing::info!(
+        "copy-back over bytes the CPU changed, per frame: {:.1} pieces, {:.0} bytes (the title wrote the page: {:.0}, \
+         the journal says not: {:.0}, cannot say: {:.0}; another host copy holds them: {:.0}); fences set at once while \
+         a submission was not landed: {:.1}; most since the last line (bytes): {}",
+        per(c.pieces),
+        per(c.bytes),
+        per(c.by_cause[0]),
+        per(c.by_cause[1]),
+        per(c.by_cause[2]),
+        per(c.other_copy),
+        early_fences,
+        top.join(", ")
+    );
 }
 
 /// A copy of `len` bytes from `src` (memory type `kind`) took `us`.
@@ -952,6 +1012,41 @@ fn submitter(all: &mut Vec<(u32, Submitter)>, id: u32) -> &mut Submitter {
     &mut all[at].1
 }
 
+/// List-call nanoseconds and calls by the line in `list.rs` that made them.
+static BY_CALLER: Mutex<Option<HashMap<u32, (u64, u64)>>> = Mutex::new(None);
+
+/// [`recorded`], counted for the call made at `line` of `list.rs`.
+pub(crate) fn recorded_at(started: std::time::Instant, line: u32) {
+    by_caller(started, line);
+    recorded(started);
+}
+
+/// Time since `started` counted under `line` alone (not as a list call).
+pub(crate) fn by_caller(started: std::time::Instant, line: u32) {
+    let ns = started.elapsed().as_nanos() as u64;
+    {
+        let mut by = BY_CALLER.lock().unwrap_or_else(|e| e.into_inner());
+        let e = by.get_or_insert_with(HashMap::new).entry(line).or_insert((0, 0));
+        e.0 += ns;
+        e.1 += 1;
+    }
+}
+
+/// The list calls that took longest since the last line, by `list.rs` line.
+fn by_caller_line(frames: f64) {
+    let Some(by) = BY_CALLER.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+        return;
+    };
+    let mut v: Vec<_> = by.into_iter().collect();
+    v.sort_by_key(|e| std::cmp::Reverse(e.1.0));
+    let top: Vec<String> = v
+        .iter()
+        .take(12)
+        .map(|(line, (ns, n))| format!("list.rs:{line} {:.1} ms in {:.0}", *ns as f64 / 1e6 / frames, *n as f64 / frames))
+        .collect();
+    tracing::info!("  list calls by caller per frame: {}", top.join(", "));
+}
+
 /// A list call on this thread that began at `started` has returned.
 pub(crate) fn recorded(started: std::time::Instant) {
     let ns = started.elapsed().as_nanos() as u64;
@@ -1286,7 +1381,9 @@ pub(crate) fn log(frames: f64) {
         .map(|r| format!("thread {} {:.0} ms in {:.0} calls", r.0, r.1 as f64 / 1e6 / frames, r.2 as f64 / frames))
         .collect();
     tracing::info!("  list calls by thread: {} threads; {}", recorders.len(), busiest.join(", "));
+    by_caller_line(frames);
     log_memory();
+    log_clobbers(frames, c[C::EarlyFences as usize]);
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
     ranges.sort_by_key(|&(_, (_, bytes, _, _))| std::cmp::Reverse(bytes));

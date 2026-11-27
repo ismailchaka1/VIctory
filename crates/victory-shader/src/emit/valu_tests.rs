@@ -1370,6 +1370,36 @@ fn v_cmp_class_f16_matches_rdna2() {
 }
 
 #[test]
+fn v_add_f64_matches_ieee754() {
+    // v_add_f64 v[5:6], v[1:2], v[3:4] (VOP3 opcode 0x164), then v_mov_b32 v0 of each word.
+    let add = vop3(0x164, 5, vgpr(1), vgpr(3), 0);
+    let lo = build_valu_cs(&[add[0], add[1], vop1(0x001, 0, vgpr(5))]);
+    let hi = build_valu_cs(&[add[0], add[1], vop1(0x001, 0, vgpr(6))]);
+    let pairs: &[(f64, f64)] = &[
+        (1.0, 2.0),
+        (0.1, 0.2),
+        (1e300, 1e300),
+        (-3.25, 3.25),
+        (1.0, f64::EPSILON / 2.0),
+        (123456.789, -0.000_001),
+    ];
+    let inputs: Vec<[u32; 4]> = pairs
+        .iter()
+        .map(|&(a, b)| {
+            let (a, b) = (a.to_bits(), b.to_bits());
+            [a as u32, (a >> 32) as u32, b as u32, (b >> 32) as u32]
+        })
+        .collect();
+    for (word, shader) in [(0, &lo), (32, &hi)] {
+        run_cases(shader, &inputs, |backend, i, _, got| {
+            let (a, b) = pairs[i];
+            let want = ((a + b).to_bits() >> word) as u32;
+            assert_eq!(got, want, "{backend}: v_add_f64({a}, {b}) word {word}");
+        });
+    }
+}
+
+#[test]
 fn v_cvt_f32_f64_matches_ieee754() {
     // v_cvt_f32_f64 v0, v[1:2] (VOP1 opcode 0x00f -> VOP3 opcode 0x18f).
     let plain = build_valu_cs(&[vop1(0x00f, 0, vgpr(1))]);

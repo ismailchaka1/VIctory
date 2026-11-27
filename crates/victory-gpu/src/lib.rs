@@ -15,8 +15,15 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
+/// Held by every test that runs work on a WARP device: two such tests at once crashed the
+/// test process about 1 run in 20 (access violation, `indirect` WARP tests in parallel).
+#[cfg(test)]
+pub(crate) static WARP_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
+#[cfg(feature = "diagnostics")]
+mod census;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
@@ -57,10 +64,11 @@ mod texture;
 mod watch;
 
 #[cfg(windows)]
-pub use host::on_failure;
+pub use host::{grant_hdr, on_failure};
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]
 pub use watch::{
-    title_memory_reading, title_memory_remapped, title_memory_remapping, writing as kernel_will_write,
+    title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_written_elsewhere, texture_memory_written,
+    use_alias_finder, use_other_addresses, writing as kernel_will_write,
 };

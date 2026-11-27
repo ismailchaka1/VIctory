@@ -47,7 +47,24 @@ pub(crate) fn listed(n: u64) -> bool {
     });
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let after = n.wrapping_sub(first);
-    named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+    let from = BUILDER.load(std::sync::atomic::Ordering::Relaxed);
+    let builder = from != u64::MAX && n.wrapping_sub(from) < 40;
+    named || builder || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+}
+
+/// The frame the ray-tracing structure builder first ran in: it and the
+/// next two are listed (it starts at a different frame each run).
+static BUILDER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// The builder runs from the frame being built on.
+pub(crate) fn builder_starts() {
+    let frame = crate::queue::presented() + 1;
+    let _ = BUILDER.compare_exchange(
+        u64::MAX,
+        frame,
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 /// With a capture folder, for the frames [`listed`]: `what` is added to
@@ -150,8 +167,14 @@ pub(crate) fn wanted(n: u64) -> bool {
     // In the world: every 8th frame's picture, a timeline of the opening
     // cutscene (its shots do not fall on the same frame numbers from run to
     // run, so single frames cannot be compared between runs).
+    // `VICTORY_CAPTURE_EVERY=<k>`: every k-th instead (1: every frame, to see
+    // a flicker; each saved frame is read back at its present).
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let every = *EVERY.get_or_init(|| {
+        std::env::var("VICTORY_CAPTURE_EVERY").ok().and_then(|v| v.parse().ok()).filter(|&k| k > 0).unwrap_or(8)
+    });
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
-    let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(8);
+    let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(every);
     folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
 }
 

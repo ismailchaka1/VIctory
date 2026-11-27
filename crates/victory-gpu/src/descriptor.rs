@@ -155,6 +155,21 @@ fn mirror(handle: u64) {
     }
 }
 
+/// S2 census: every resource the host heaps' slots view, with how many of the title's own slots
+/// and how many dynamic ones view it. Empty if the heap table is busy.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn slot_holders() -> std::collections::HashMap<usize, [u32; 2]> {
+    let mut out = std::collections::HashMap::new();
+    let Ok(heaps) = SHADER_HEAPS.try_lock() else { return out };
+    for &(_, _, heap) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped).
+        if let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get() {
+            host.holders(&mut out);
+        }
+    }
+    out
+}
+
 /// Gives back dynamic slots of the host heap behind the title heap at
 /// `heap`, if that heap still exists.
 #[cfg(windows)]
@@ -305,12 +320,16 @@ pub(crate) enum View {
 
 impl View {
     /// Whether the view reads buffer memory (constant buffers, buffer views
-    /// of resources or of memory) or memory the title placed a texture in:
-    /// such views get host slots only for draws.
+    /// of resources or of memory) or memory the title placed a texture in
+    /// to sample: such views get host slots only for draws. Placed
+    /// unordered texture views live on the host alone, as texture objects'
+    /// unordered views do, so shader-visible heap writes mirror them.
     #[cfg(windows)]
     fn is_buffer(&self) -> bool {
+        const BUFFER: u32 = 1;
         match self {
-            View::Constant(..) | View::Placed(..) => true,
+            View::Constant(..) | View::Placed(false, ..) => true,
+            View::Placed(true, resource, _) => resource[0] == BUFFER,
             View::Shader(r, _) | View::Unordered(r, _, _) => {
                 crate::resource::buffer_bytes(*r as This).is_some()
             }
@@ -743,6 +762,22 @@ pub(crate) fn view(handle: u64) -> Option<View> {
         return None;
     }
     view_at(i, generation)
+}
+
+/// Why [`view`] found nothing at `handle` (diagnostics): 0 an empty slot,
+/// 1 a view tag whose entry is gone (released, or written again), 2 other
+/// bytes.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn why_none(handle: u64) -> u8 {
+    if handle == 0 {
+        return 0;
+    }
+    // SAFETY: the handle is a descriptor slot the title passes back.
+    match unsafe { (handle as *const [u32; 3]).read_unaligned() } {
+        [0, 0, 0] => 0,
+        [VIEW_TAG, ..] => 1,
+        _ => 2,
+    }
 }
 
 /// A description of `N` words, if the title passes one.

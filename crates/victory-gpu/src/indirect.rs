@@ -252,7 +252,9 @@ pub(crate) fn bound(
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp(c, &list.list, &dst, budget, src, count, spec).then_some(dst)
+    let held = list.scratch_held(&dst);
+    let ok = record_clamp_as(c, &list.list, &dst, budget, src, count, spec, false, held);
+    ok.then(|| list.hold_scratch(&dst)).map(|()| dst)
 }
 
 /// [`bound`] for a window of records clamped ahead of the draws that will
@@ -272,9 +274,12 @@ pub(crate) fn bound_ahead(
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true).then_some(dst)
+    let held = list.scratch_held(&dst);
+    let ok = record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true, held);
+    ok.then(|| list.hold_scratch(&dst)).map(|()| dst)
 }
 
+#[cfg(test)]
 fn record_clamp(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
@@ -284,11 +289,12 @@ fn record_clamp(
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
 ) -> bool {
-    record_clamp_as(c, l, dst, budget, src, count, spec, false)
+    record_clamp_as(c, l, dst, budget, src, count, spec, false, false)
 }
 
 /// [`record_clamp`]; `ahead`: the records are a window clamped ahead of
-/// their draws ([`bound_ahead`]).
+/// their draws ([`bound_ahead`]); `held`: `dst` is still in
+/// `INDIRECT_ARGUMENT` from the list's last clamp, not in `COMMON`.
 #[allow(clippy::too_many_arguments)]
 fn record_clamp_as(
     c: &Clamp,
@@ -299,6 +305,7 @@ fn record_clamp_as(
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
     ahead: bool,
+    held: bool,
 ) -> bool {
     let Some(bytes) = validate_layout(
         (kind, stride, records),
@@ -360,7 +367,7 @@ fn record_clamp_as(
         uav_barrier(),
         transition(
             dst,
-            D3D12_RESOURCE_STATE_COMMON,
+            if held { D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT } else { D3D12_RESOURCE_STATE_COMMON },
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         ),
     ];
@@ -391,12 +398,7 @@ fn record_clamp_as(
     true
 }
 
-/// After indirect execution (or if preparation failed after [`bound`]):
-/// returns the scratch buffer to the common state for the next call.
-pub(crate) fn done(list: &HostList, scratch: &ID3D12Resource) {
-    done_on(&list.list, scratch);
-}
-
+#[cfg(test)]
 fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
     // SAFETY: an open list and a live scratch buffer in INDIRECT_ARGUMENT.
     unsafe {
@@ -451,10 +453,13 @@ void main() {
         event: HANDLE,
         clamp: Clamp,
         worker: Clamp,
+        // last: dropped after the device's objects
+        _one_at_a_time: std::sync::MutexGuard<'static, ()>,
     }
 
     impl WarpHarness {
         fn new() -> Option<Self> {
+            let one_at_a_time = crate::WARP_TESTS.lock().unwrap_or_else(|e| e.into_inner());
             // SAFETY: plain DXGI WARP query and D3D12 test harness setup.
             unsafe {
                 let factory: IDXGIFactory4 =
@@ -493,6 +498,7 @@ void main() {
                     event,
                     clamp,
                     worker,
+                    _one_at_a_time: one_at_a_time,
                 })
             }
         }
@@ -671,6 +677,7 @@ void main() {
         let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
         let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES));
         let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
+        let (_slots, _, slots_gpu) = warp.shared_buffer(16);
         let content: Vec<u8> = (0..size).map(|i| (i * 31 + i / 251) as u8).collect();
         // SAFETY: the mapping holds `size` bytes.
         unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
@@ -690,6 +697,7 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(4, slots_gpu);
                 warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
             }
             warp.submit_and_wait();
@@ -718,6 +726,79 @@ void main() {
         set(content[at]);
         assert_eq!(run(&mut warp, 2), [0, 1, 0]);
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
+    }
+
+    /// Told 3 the compare copies each piece it flags into the slots buffer,
+    /// at a slot counted in its first dword, and flags the piece with the
+    /// slot plus 2; a piece that finds no slot left is flagged 1 and not
+    /// copied (`crate::host::fetch_in_flight`). The pieces it leaves alone
+    /// are flagged 0. Piece 0 starts at the copy's skew.
+    #[test]
+    fn warp_card_compare_copies_flagged_pieces_in_flight() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
+        const PIECE: usize = 64 << 10;
+        const SLOT: usize = 65552;
+        const PIECES: u32 = 3;
+        const SKEW: u32 = 48;
+        let size = PIECE * PIECES as usize;
+        let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
+        let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES + 1));
+        let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
+        // Room for one slot only: the second flagged piece finds none.
+        let (_slots, slots_ptr, slots_gpu) = warp.shared_buffer((16 + SLOT) as u64);
+        let content: Vec<u8> = (0..size).map(|i| (i * 31 + i / 251) as u8).collect();
+        // SAFETY: the mapping holds `size` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
+        let run = |warp: &mut WarpHarness, mode: u32| -> [u32; 3] {
+            // SAFETY: our open list, live buffers, the compare's own root
+            // signature; the mappings hold what is read and written.
+            unsafe {
+                slots_ptr.cast::<u32>().write_volatile(0);
+                slots_ptr.cast::<u32>().add(1).write_volatile(1);
+                warp.list.SetComputeRootSignature(&compare.root);
+                warp.list.SetPipelineState(&compare.pso);
+                let constants = [0u32, SKEW, size as u32, PIECES, 0, mode];
+                warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(4, slots_gpu);
+                warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
+            }
+            warp.submit_and_wait();
+            // SAFETY: as above.
+            [0, 1, 2].map(|piece| unsafe { differs_ptr.cast::<u32>().add(piece).read_volatile() })
+        };
+        // SAFETY (each): inside the mapping.
+        let set = |at: usize, value: u8| unsafe { now_ptr.add(at).write_volatile(value) };
+        // 0 stores the hashes (and leaves `differs` alone); then nothing differs.
+        run(&mut warp, 0);
+        assert_eq!(run(&mut warp, 3), [0, 0, 0]);
+        // One change in piece 1: copied into slot 0, flagged 2.
+        let at = PIECE + 1234;
+        set(at, content[at] ^ 0x40);
+        assert_eq!(run(&mut warp, 3), [0, 2, 0]);
+        // The slot holds piece 1 as the compare read it: from (1 * 64 KiB -
+        // skew) rounded down to 16 bytes, the change included.
+        let start = (PIECE - SKEW as usize) & !15;
+        let mut want = content[start..start + PIECE].to_vec();
+        want[at - start] ^= 0x40;
+        // SAFETY: the slot's bytes, written by the compare that ran.
+        let got = unsafe { std::slice::from_raw_parts(slots_ptr.add(16), PIECE) };
+        assert!(got == want.as_slice(), "the in-flight copy of piece 1 differs from the piece");
+        // Changes in pieces 0 and 2: one finds the slot, the other none (1).
+        set(10, content[10] ^ 1);
+        set(2 * PIECE + 10, content[2 * PIECE + 10] ^ 1);
+        let flags = run(&mut warp, 3);
+        assert_eq!(flags[1], 0, "flags {flags:?}");
+        let mut ends = [flags[0], flags[2]];
+        ends.sort_unstable();
+        assert_eq!(ends, [1, 2]);
+        // SAFETY: the count dword.
+        assert_eq!(unsafe { slots_ptr.cast::<u32>().read_volatile() }, 2);
     }
 
     /// The clamp compiles with the system's compiler and the host takes it.
@@ -1004,6 +1085,7 @@ void main() {
                 None,
                 (KIND_MESH, STRIDE, RECORDS),
                 ahead,
+                false,
             ));
             done_on(&warp.list, &dst_buf);
             // SAFETY: an open list; the scratch buffer is copied for the check.
@@ -1152,7 +1234,8 @@ void main() {
         assert_eq!((kept, zeroed), (2, (RECORDS as usize) - 2));
     }
 
-    /// Exercises `HostList::indirect_scratch`, `bound`, `done`, `Host::execute`,
+    /// Exercises `HostList::indirect_scratch`, `bound` (the scratch held between
+    /// clamps), `Host::execute`,
     /// and `HostList::reset` end-to-end on the host device.
     #[test]
     fn host_list_reuses_and_grows_scratch_across_submissions() {
@@ -1177,9 +1260,7 @@ void main() {
         // First two calls fit inside the initial 64 KiB scratch buffer and
         // must reuse the exact same `ID3D12Resource`.
         let b1 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 64)).unwrap();
-        done(&list, &b1);
         let b2 = bound(&list, (&src_buf, 64), Some((&count_buf, 0)), (1, 20, 128)).unwrap();
-        done(&list, &b2);
         assert_eq!(
             b1.as_raw(),
             b2.as_raw(),
@@ -1189,7 +1270,6 @@ void main() {
         // A call needing >64 KiB grows the scratch buffer mid-list while keeping
         // `b1` alive until reset.
         let b3 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 5000)).unwrap();
-        done(&list, &b3);
         assert_ne!(
             b3.as_raw(),
             b1.as_raw(),
@@ -1203,7 +1283,6 @@ void main() {
         // After reset, requests up to the grown high-water mark reuse `b3` with
         // zero new allocations.
         let b4 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 4096)).unwrap();
-        done(&list, &b4);
         assert_eq!(
             b4.as_raw(),
             b3.as_raw(),

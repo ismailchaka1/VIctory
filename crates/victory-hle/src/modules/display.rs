@@ -57,11 +57,21 @@ pub const INTERFACES: &[Interface] = &[
 
 type This = *const Object;
 
-/// 2: disabled. We present in SDR, so the title must render SDR.
-// shortcut: HDR output is not done (see the presentation items in
-// `TODO.md`); report enabled, with the host display's luminance, once the
-// swap chain can present HDR.
-extern "system" fn try_enable_hdr(_: This, preference: u32, _info: *mut c_void) -> u32 {
+/// 1: enabled, with the host display's luminances written to `info`
+/// (minimum, maximum and full-frame maximum tone-map luminance, floats in
+/// nits), when Windows drives the display in HDR; else 2: disabled, and the
+/// title renders SDR.
+extern "system" fn try_enable_hdr(_: This, preference: u32, info: *mut c_void) -> u32 {
+    #[cfg(windows)]
+    if let Some(nits) = victory_gpu::grant_hdr() {
+        if !info.is_null() {
+            // SAFETY: the title passes room for its three luminances.
+            unsafe { info.cast::<[f32; 3]>().write_unaligned(nits) };
+        }
+        tracing::info!(preference, ?nits, "HDR mode: enabled (HDR10 presentation)");
+        return 1;
+    }
+    let _ = info;
     tracing::info!(preference, "HDR mode: disabled (SDR presentation)");
     2
 }
@@ -178,10 +188,13 @@ mod tests {
     #[test]
     fn sdr_and_display_deferrals() {
         type Hdr = extern "system" fn(This, u32, *mut c_void) -> u32;
+        let mut nits = [0f32; 3];
+        let hdr = victory_gpu::grant_hdr();
         assert_eq!(
-            method::<Hdr>(&HDR_OBJECT, 0x20)(&HDR_OBJECT, 0, std::ptr::null_mut()),
-            2
+            method::<Hdr>(&HDR_OBJECT, 0x20)(&HDR_OBJECT, 0, nits.as_mut_ptr().cast()),
+            if hdr.is_some() { 1 } else { 2 }
         );
+        assert_eq!(hdr.unwrap_or_default(), nits);
         type Acquire = extern "system" fn(This, *mut *mut c_void) -> HRESULT;
         type Close = extern "system" fn(This, *mut c_void);
         let mut handle = std::ptr::null_mut();

@@ -420,6 +420,7 @@ mod tests {
             if ended { "ENDED" } else { "STILL RUNNING" },
             if still_running { "KEPT" } else { "NOT KEPT" }
         );
+        victory_core::logging::flush();
         std::process::exit(0);
     }
 

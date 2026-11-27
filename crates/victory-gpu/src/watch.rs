@@ -208,6 +208,28 @@ pub(crate) fn ask_once_end() {
     }
 }
 
+/// Whether the kernel's dirty bits say the title wrote `[start, end)` since
+/// they were last reset there (they are not reset now), and whether the
+/// journal ever noted a page of it written (A5 of the census plan;
+/// diagnostics). `None` if the memory is not write-watched.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn dirty(start: usize, end: usize) -> Option<(bool, bool)> {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    let (first, last) = (start / KERNEL_PAGE, end.div_ceil(KERNEL_PAGE));
+    let mut found = vec![0usize; last.saturating_sub(first).max(1)];
+    let (mut count, mut granularity) = (found.len(), 0);
+    // SAFETY: the answer buffer holds `count` entries; flag 0 resets nothing.
+    let failed = unsafe {
+        GetWriteWatch(0, (first * KERNEL_PAGE) as *const _, (last - first) * KERNEL_PAGE, found.as_mut_ptr().cast(), &mut count, &mut granularity)
+    } != 0;
+    if failed {
+        return None;
+    }
+    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let journal = j.written.range(start / PAGE..end.div_ceil(PAGE)).next().is_some();
+    Some((count > 0, journal))
+}
+
 /// We wrote title memory `[at, at + len)` while a submission's one asking
 /// stands (the title's buffer copies, done at submission): its pages count
 /// as written after that asking, so the refreshes that follow copy them.
@@ -368,6 +390,20 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     ))
 }
 
+/// Before a placed texture picked by index is uploaded from title memory
+/// `[start, end)`: its view memory's blocks are guarded (as a host copy's
+/// are, journaled for the other askers), so a later write to it, by the
+/// title's CPU, by a copy-back landing there, or through another address of
+/// its physical pages, faults into our handler, which makes the slot due
+/// again ([`open`] → `descriptor::host::remapped`). Before, only a
+/// fingerprint looked at a few times after the upload found such a change
+/// (census run 125: 227 "changed after its upload", up to ~700 frames late).
+/// shortcut: memory that is write-watched, not a view, is not watched for
+/// textures here; the fingerprint recheck still covers it.
+pub(crate) fn guard_texture(start: usize, end: usize) {
+    let _ = writes(start, end, true);
+}
+
 /// Guarded blocks of view memory.
 const BLOCK: usize = PAGE;
 
@@ -379,13 +415,78 @@ struct Guards {
     /// Blocks already copied as zeros. While they remain wholly uncommitted,
     /// the copy can skip hundreds of MB of failing kernel reads per world frame.
     absent: BTreeSet<usize>,
+    /// Blocks made read-only because they show the same physical memory as
+    /// guarded blocks ([`use_alias_finder`]), and those guarded blocks: a
+    /// write through one is a write to them.
+    alias: std::collections::BTreeMap<usize, Vec<usize>>,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
     clean: BTreeSet::new(),
     absent: BTreeSet::new(),
+    alias: std::collections::BTreeMap::new(),
 });
+
+/// The runtime's answer to "which other addresses show the physical memory
+/// at this (64 KiB aligned) address" (`victory-hle` xmem).
+static ALIAS_FINDER: std::sync::OnceLock<fn(usize) -> Vec<usize>> = std::sync::OnceLock::new();
+
+/// The runtime tells how to find the other addresses of physical memory: a
+/// guarded block's are guarded with it, and a write through any of them
+/// counts as a write to the block (the title maps its ray-tracing
+/// structures' pages at two addresses, run vis-34).
+pub fn use_alias_finder(finder: fn(usize) -> Vec<usize>) {
+    let _ = ALIAS_FINDER.set(finder);
+}
+
+/// Guards the other addresses of `block`'s memory too, noting whose they are.
+fn protect_aliases(g: &mut Guards, block: usize) {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+    let Some(find) = ALIAS_FINDER.get() else {
+        return;
+    };
+    for other in find(block * BLOCK) {
+        let ab = other / BLOCK;
+        if ab == block {
+            continue;
+        }
+        if !g.protected.contains(&ab) {
+            let mut old = 0;
+            // SAFETY: title view memory; only its protection changes.
+            if unsafe { VirtualProtect((ab * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } == 0 {
+                continue;
+            }
+            g.protected.insert(ab);
+        }
+        let of = g.alias.entry(ab).or_default();
+        if !of.contains(&block) {
+            of.push(block);
+        }
+    }
+}
+
+/// Bytes `[at, at + len)` of title memory were written by other means than
+/// a guarded address (DirectStorage into physical pages): their guarded
+/// blocks count as written.
+/// Title memory was written outside the guards' sight (a DirectStorage
+/// destination): the textures placed there are due again (census A5).
+/// No page protection, unlike [`title_memory_written_elsewhere`], so
+/// DirectStorage's own writes keep working (run t1-5 failed them).
+pub fn texture_memory_written(at: usize, len: usize) {
+    crate::descriptor::host::remapped(at, len);
+}
+
+pub fn title_memory_written_elsewhere(at: usize, len: usize) {
+    // A placed texture there changed with no descriptor written.
+    crate::descriptor::host::remapped(at, len);
+    let mut g = guards();
+    let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
+    let blocks: Vec<usize> = g.protected.range(range).copied().collect();
+    for block in blocks {
+        g.clean.remove(&block);
+    }
+}
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
@@ -450,6 +551,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             if g.protected.contains(&block) {
                 // Written through the runtime, still read-only.
                 g.clean.insert(block);
+                protect_aliases(&mut g, block);
             } else {
                 run.get_or_insert(block);
                 continue;
@@ -526,6 +628,9 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.extend(from..to);
         g.clean.extend(from..to);
+        for block in from..to {
+            protect_aliases(g, block);
+        }
     };
     if set(from, to) {
         note(g, from, to);
@@ -568,6 +673,16 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     for &block in &blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
+        // A placed texture there changed with no descriptor written
+        // ([`guard_texture`]). (Locks one mutex of its own, calls nothing.)
+        crate::descriptor::host::remapped(block * BLOCK, BLOCK);
+        // Another address of guarded memory: those blocks are written.
+        if let Some(of) = g.alias.remove(&block) {
+            for b in of {
+                g.clean.remove(&b);
+                crate::descriptor::host::remapped(b * BLOCK, BLOCK);
+            }
+        }
         let mut old = 0;
         // SAFETY: a block we made read-only.
         unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
@@ -584,6 +699,57 @@ pub fn writing(at: usize, len: usize) {
     open(&mut guards(), at, at.saturating_add(len));
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
+    textures_at_other_addresses(at, len);
+}
+
+/// The runtime's "other addresses of this physical page" for
+/// [`textures_at_other_addresses`] alone (no page is protected, unlike
+/// [`use_alias_finder`], which is only set with `VICTORY_ALIAS_GUARDS=1`).
+static OTHER_ADDRESSES: std::sync::OnceLock<fn(usize) -> Vec<usize>> = std::sync::OnceLock::new();
+
+pub fn use_other_addresses(finder: fn(usize) -> Vec<usize>) {
+    let _ = OTHER_ADDRESSES.set(finder);
+}
+
+/// Textures placed at another address of the physical pages `[at, at +
+/// len)` show are due again too: copy-backs land at a buffer's address and
+/// the texture is read through another (census A5, run t1-16: ~100 of the
+/// ~110 changes a frame were in physical views under a host copy).
+fn textures_at_other_addresses(at: usize, len: usize) {
+    let Some(find) = OTHER_ADDRESSES.get() else {
+        return;
+    };
+    for (page, lo, hi) in page_parts(at, len) {
+        for other in find(page) {
+            crate::descriptor::host::remapped(other + lo, hi - lo);
+        }
+    }
+}
+
+/// The 64 KiB pages `[at, at + len)` touches: each page's address and the
+/// byte range `[lo, hi)` of it written.
+fn page_parts(at: usize, len: usize) -> Vec<(usize, usize, usize)> {
+    const PAGE: usize = 64 << 10;
+    let end = at.saturating_add(len);
+    let mut parts = Vec::new();
+    let mut page = at & !(PAGE - 1);
+    while page < end {
+        parts.push((page, at.max(page) - page, end.min(page + PAGE) - page));
+        page += PAGE;
+    }
+    parts
+}
+
+#[cfg(test)]
+mod page_parts_tests {
+    #[test]
+    fn a_write_across_pages_is_cut_per_page() {
+        let k = 64 << 10;
+        assert_eq!(super::page_parts(k + 16, 32), [(k, 16, 48)]);
+        assert_eq!(super::page_parts(k - 8, 16), [(0, k - 8, k), (k, 0, 8)]);
+        assert_eq!(super::page_parts(2 * k, 2 * k), [(2 * k, 0, k), (3 * k, 0, k)]);
+        assert!(super::page_parts(k, 0).is_empty());
+    }
 }
 
 /// Held shared by a read of title memory in place, and alone by the runtime
@@ -652,10 +818,28 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     for block in absent {
         g.absent.remove(&block);
     }
+    let aliases: Vec<usize> = g.alias.range(range.clone()).map(|(&b, _)| b).collect();
+    for block in aliases {
+        g.alias.remove(&block);
+    }
     let blocks: Vec<usize> = g.protected.range(range).copied().collect();
     for block in blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
+        // Write access back first: the runtime tells of an unmap before it unmaps (xmem's view
+        // removal), and a write in between found a read-only block that was no longer ours, which
+        // the handler passed on (track5-17: DirectStorage's inflate, AV in memcpy). Fails harmlessly
+        // where nothing is mapped any more.
+        let mut old = 0;
+        // SAFETY: a block we made read-only; only its protection changes.
+        unsafe {
+            windows_sys::Win32::System::Memory::VirtualProtect(
+                (block * BLOCK) as *const _,
+                BLOCK,
+                windows_sys::Win32::System::Memory::PAGE_READWRITE,
+                &mut old,
+            )
+        };
     }
 }
 
@@ -1034,6 +1218,10 @@ mod tests {
         title_memory_remapped(p + BLOCK, BLOCK);
         assert_eq!(guard(p, p + 3 * BLOCK), Some(pages(1).collect()));
         assert_eq!(guard(p, p + 3 * BLOCK), Some(Vec::new()));
+        // Told of an unmap before it happens: the guarded block, still mapped, takes writes.
+        assert!(!writable(p), "guarded");
+        title_memory_remapped(p, BLOCK);
+        assert!(writable(p), "a block no longer ours is not left read-only");
         // SAFETY: our views and placeholder.
         unsafe {
             UnmapViewOfFile2(GetCurrentProcess(), first, MEM_PRESERVE_PLACEHOLDER);

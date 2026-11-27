@@ -51,6 +51,26 @@ pub const SLOT_FAULTS: u8 = 253;
 pub const MEMORY_PAGES: u32 = 1 << 21;
 /// Dwords of the [`SLOT_FAULTS`] buffer.
 pub const MEMORY_FAULTS: u32 = 4096;
+/// Dwords after [`MEMORY_FAULTS`] in the [`SLOT_FAULTS`] buffer: one bit
+/// per directory page that a store or atomic through a raw address reached
+/// (bit `page & 31` of dword `MEMORY_FAULTS + page / 32`), so the host
+/// copies back only pages shaders write, not every numbered copy whole.
+pub const MEMORY_WRITTEN: u32 = MEMORY_PAGES / 32;
+/// Dwords after [`MEMORY_WRITTEN`]: one per directory page, made nonzero by
+/// every access that found a copy there, so the host can give up copies
+/// shaders no longer touch.
+pub const MEMORY_TOUCHED: u32 = MEMORY_PAGES;
+/// The root UAV `u<SLOT_READS>`, a buffer in the card's memory of its own
+/// (not the CPU-mapped [`SLOT_FAULTS`]: read per pixel, it cost 76 ms a
+/// frame there): [`SLOTS_READ`] dwords.
+pub const SLOT_READS: u8 = 252;
+/// Dwords of the [`SLOT_READS`] buffer: one bit per view-heap slot a texture
+/// handle picked from the heap by a computed index named (bit `slot & 31`
+/// of dword `slot / 32`; slots past the last bit set the last), so the host
+/// knows which index-picked textures are in use. Set only when
+/// [`super::slots_read`] is on; a shader reads its dword first and does the
+/// atomic only while the bit is clear.
+pub const SLOTS_READ: u32 = SLOT_STRIDES_COUNT / 32;
 /// `RootType::Other` code of a user-data dword the host computes: the view
 /// heap slot of the memory copies' views ([`SLOT_MEMORY`]).
 pub const USER_MEMORY_BASE: u32 = 0x100;
@@ -69,11 +89,16 @@ pub const USER_VIEW_ADDRESS: u32 = 0x101;
 /// view. Asked for every root UAV, and for the root SRVs of programs with
 /// a spilled user-data table.
 pub const USER_VIEW_BIAS: u32 = 0x103;
+/// `RootType::Other` code of a user-data dword the host computes: the x group a dispatch's
+/// partial last group stands for, read by a tail program ([`super::translate`]).
+pub const USER_GROUP_BASE: u32 = 0x104;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const DOUBLES: u64 = 1 << 2;
+    pub const FORCE_EARLY_DEPTH: u64 = 1 << 3;
+    pub const UAVS_AT_EVERY_STAGE: u64 = 1 << 16;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     pub const WAVE_OPS: u64 = 1 << 19;
@@ -130,6 +155,82 @@ pub fn view_heap_limit() -> u32 {
     VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Gives every element of a row the same interpolation mode: constant (1)
+/// if any element of the row has it, else the row's first element's.
+fn unify_row_interp(elements: &mut [SigElement]) {
+    let rows: Vec<u32> = elements.iter().filter_map(|e| e.row).collect();
+    for row in rows {
+        let modes: Vec<u8> = elements.iter().filter(|e| e.row == Some(row)).map(|e| e.interp).collect();
+        let mode = if modes.contains(&1) { 1 } else { modes[0] };
+        for e in elements.iter_mut().filter(|e| e.row == Some(row)) {
+            e.interp = mode;
+        }
+    }
+}
+
+impl Shader {
+    /// [`super::translate_keeping`]: a mesh shader's vertex outputs past
+    /// 32 KiB lose the elements the pixel shader does not read (system
+    /// values stay), and their stores go with them.
+    fn trim_mesh_outputs(&mut self, m: Mesh) {
+        let Some(keep) = super::KEEP_OUTPUTS.with(|k| k.borrow().clone()) else { return };
+        let bytes = |o: &[SigElement]| container::mesh_output_bytes(o, &self.prims, m.max_vertices, m.max_primitives);
+        if bytes(&self.outputs) <= container::MESH_OUTPUT_LIMIT {
+            return;
+        }
+        let kept = |e: &SigElement| e.kind != 0 || keep.iter().any(|(n, i)| n.eq_ignore_ascii_case(&e.name) && *i == e.index);
+        let mut map = Vec::with_capacity(self.outputs.len());
+        let mut next = 0;
+        for e in &self.outputs {
+            map.push(kept(e).then(|| {
+                next += 1;
+                next - 1
+            }));
+        }
+        self.outputs.retain(|e| kept(e));
+        self.m.remap_output_ids("storeVertexOutput", &map);
+    }
+
+    /// [`super::translate_keeping`] for a pixel shader drawn with a mesh
+    /// shader trimmed by [`Self::trim_mesh_outputs`]: its inputs not in the
+    /// list (declared, never read) go too, since D3D12 links a pixel
+    /// shader's declared inputs to the mesh shader's outputs ("linkage
+    /// error", run track3-7). System values stay.
+    fn trim_pixel_inputs(&mut self) {
+        let Some(keep) = super::KEEP_OUTPUTS.with(|k| k.borrow().clone()) else { return };
+        let kept = |e: &SigElement| e.kind != 0 || keep.iter().any(|(n, i)| n.eq_ignore_ascii_case(&e.name) && *i == e.index);
+        let mut map = Vec::with_capacity(self.inputs.len());
+        let mut next = 0;
+        for e in &self.inputs {
+            map.push(kept(e).then(|| {
+                next += 1;
+                next - 1
+            }));
+        }
+        self.inputs.retain(|e| kept(e));
+        for name in ["loadInput", "attributeAtVertex"] {
+            self.m.remap_output_ids(name, &map);
+        }
+    }
+
+    /// A pixel shader whose only UAV writes are the slots-read marks, with
+    /// no discard and no depth, stencil or coverage output: the marks would
+    /// cost the driver's early depth test, and forcing it changes nothing
+    /// else (a fragment the test kills would not have written anything).
+    pub(crate) fn early_depth_safe(&self) -> bool {
+        if !self.pixel || self.slot_marks == 0 || self.m.declares("discard") {
+            return false;
+        }
+        // SV_Coverage 14, SV_Depth 17, SV_StencilRef 20, SV_DepthGreaterEqual 22, SV_DepthLessEqual 23.
+        if self.outputs.iter().any(|o| matches!(o.kind, 14 | 17 | 20 | 22 | 23)) {
+            return false;
+        }
+        let c = self.m.census();
+        let k = |s: &str| c.counts[super::bitcode::census::KINDS.iter().position(|k| *k == s).unwrap()];
+        k("buffer_store") == 0 && k("atomic") == self.slot_marks
+    }
+}
+
 pub(crate) struct Shader {
     pub m: Module,
     pub t: Types,
@@ -155,6 +256,14 @@ pub(crate) struct Shader {
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
     pub flags: u64,
+    /// Atomics the slots-read marks added (not the title's own writes).
+    pub slot_marks: u32,
+    /// The root UAVs are globally coherent: the program reads memory with
+    /// `glc` (past the wave's caches), as the ray-tracing builder's stages
+    /// do to wait for each other's writes (`5552dac6` spins on a flag
+    /// another group sets). Without it a host group can read its own stale
+    /// cache line for ever.
+    pub coherent: bool,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
     /// A compute shader with this thread-group size.
@@ -213,6 +322,8 @@ impl Shader {
             root_uavs: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,
+            slot_marks: 0,
+            coherent: false,
             threads: None,
             wave_size: None,
             lds_dwords: 0,
@@ -346,7 +457,9 @@ impl Shader {
             217,
             &[bind, r, f],
         );
-        let h = self.annotate(block, h, 11 | 0x1000, 0);
+        // Properties: raw buffer (11), UAV (0x1000), globally coherent (0x4000).
+        let props = 11 | 0x1000 | if self.coherent { 0x4000 } else { 0 };
+        let h = self.annotate(block, h, props, 0);
         self.flags |= flags::RAW_BUFFERS;
         self.root_uavs.push((slot, h));
         h
@@ -445,6 +558,12 @@ impl Shader {
 
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
+        if let Some(m) = self.mesh {
+            self.trim_mesh_outputs(m);
+        }
+        if self.pixel {
+            self.trim_pixel_inputs();
+        }
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         // The clean-up, before anything is declared about the code: a
@@ -570,6 +689,8 @@ impl Shader {
                 let u = self.m.undef(p);
                 let no = self.m.bool(false);
                 let no = self.m.md_value(no);
+                let coherent = self.m.bool(self.coherent);
+                let coherent = self.m.md_value(coherent);
                 let mut list = Vec::new();
                 for (n, (slot, _)) in self.root_uavs.clone().into_iter().enumerate() {
                     // Id, variable, name, space, lower bound, range size,
@@ -583,7 +704,7 @@ impl Shader {
                         Some(i32c(&mut self, u32::from(slot))),
                         Some(i32c(&mut self, 1)),
                         Some(i32c(&mut self, 11)),
-                        Some(no),
+                        Some(coherent),
                         Some(no),
                         Some(no),
                         None,
@@ -679,6 +800,14 @@ impl Shader {
             self.m.named_md("dx.viewIdState", vec![view_node]);
         }
 
+        // Outputs of a vertex, mesh or geometry shader packed into one row
+        // share an interpolation mode in DXIL (the console packs a uint and
+        // a float together: meshes 0bd4d80a, 63083c77). The pixel shader's
+        // inputs decide the interpolation, so the row takes "constant" if
+        // any of its elements has it, else its first element's mode.
+        if !self.pixel {
+            unify_row_interp(&mut self.outputs);
+        }
         let sigs = if graphics {
             let ins = self.signature_md(self.inputs.clone());
             let outs = self.signature_md(self.outputs.clone());
@@ -690,6 +819,16 @@ impl Shader {
         // A pixel shader with an SV_StencilRef output (as DXC collects it).
         if self.pixel && self.outputs.iter().any(|o| o.kind == 20) {
             self.flags |= flags::STENCIL_REF;
+        }
+        // A UAV outside pixel and compute shaders (the slots-read marks put
+        // one in mesh and vertex shaders): "Flags must match usage" without.
+        if !self.pixel && self.threads.is_none() || self.mesh.is_some() || self.geometry.is_some() {
+            if !self.root_uavs.is_empty() {
+                self.flags |= flags::UAVS_AT_EVERY_STAGE;
+            }
+        }
+        if self.early_depth_safe() {
+            self.flags |= flags::FORCE_EARLY_DEPTH;
         }
         // Entry properties: shader flags (tag 0), geometry state (1),
         // thread-group size (4), wave size (11).
@@ -783,6 +922,9 @@ impl Shader {
         }
         if self.flags & flags::STENCIL_REF != 0 {
             features |= 0x200;
+        }
+        if self.flags & flags::UAVS_AT_EVERY_STAGE != 0 {
+            features |= 0x4;
         }
         if self.flags & flags::TYPED_UAV_LOADS != 0 {
             features |= 0x800;
@@ -886,5 +1028,91 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A shader with one slots-read style atomic in its entry block.
+    fn marked(pixel: bool) -> Shader {
+        let mut s = Shader::new(pixel);
+        let faults = s.root_uav_handle(SLOT_READS);
+        let (i32t, zero, iu) = (s.t.i32, s.m.i32(0), s.m.undef(s.t.i32));
+        let b = s.entry;
+        s.op(b, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[faults, zero, zero, iu, iu, zero]);
+        s.slot_marks = 1;
+        s
+    }
+
+    fn element(name: &str, row: u32, col: u8, interp: u8) -> SigElement {
+        SigElement { name: name.into(), index: 0, kind: 0, comp: 3, interp, row: Some(row), col, cols: 1, usage: 1, half: false }
+    }
+
+    #[test]
+    fn mesh_outputs_past_32_kib_keep_what_the_pixel_shader_reads() {
+        let mut s = Shader::new(false);
+        s.threads = Some([128, 1, 1]);
+        s.mesh = Some(Mesh { max_vertices: 128, max_primitives: 128, topology: 2 });
+        // SV_Position, then 17 TEXCOORDs of 4: 72 values a vertex, past 32 KiB.
+        let mut pos = element("SV_Position", 0, 0, 4);
+        (pos.kind, pos.cols) = (3, 4);
+        s.outputs.push(pos);
+        for i in 0..17 {
+            let mut e = element("TEXCOORD", i + 1, 0, 2);
+            (e.index, e.cols) = (i, 4);
+            s.outputs.push(e);
+        }
+        let (b, void, f32t) = (s.entry, s.t.void, s.t.f32);
+        for id in 0..18u32 {
+            let (id, z, x) = (s.m.i32(id), s.m.i32(0), s.m.f32(1.0f32.to_bits()));
+            let zero8 = s.m.i8(0);
+            s.op(b, "storeVertexOutput.f32", Attr::NoUnwind, void, 171, &[id, z, zero8, x, z]);
+        }
+        let _ = f32t;
+        // The pixel shader reads all but TEXCOORD 3 and 5.
+        let keep: Vec<(String, u32)> = (0..17).filter(|i| ![3, 5].contains(i)).map(|i| ("TEXCOORD".to_owned(), i)).collect();
+        super::super::KEEP_OUTPUTS.with(|k| *k.borrow_mut() = Some(keep));
+        s.trim_mesh_outputs(s.mesh.unwrap());
+        super::super::KEEP_OUTPUTS.with(|k| *k.borrow_mut() = None);
+        assert_eq!(s.outputs.len(), 16, "SV_Position and 15 TEXCOORDs");
+        assert!(s.outputs.iter().all(|e| !(e.name == "TEXCOORD" && [3, 5].contains(&e.index))));
+        assert_eq!(s.m.census().counts[super::super::bitcode::census::KINDS.iter().position(|k| *k == "io_other").unwrap()], 16, "two stores gone");
+    }
+
+    #[test]
+    fn a_row_takes_one_interpolation_mode() {
+        let mut e = vec![element("A", 9, 0, 1), element("B", 9, 3, 2), element("C", 4, 0, 2), element("D", 4, 1, 4)];
+        unify_row_interp(&mut e);
+        assert_eq!(e.iter().map(|e| e.interp).collect::<Vec<_>>(), [1, 1, 2, 2]);
+    }
+
+    #[test]
+    fn signature_rows_keep_element_order_within_a_register() {
+        // Element 0 at column 1, element 1 at column 0, both in register 3.
+        let e = vec![element("TEXCOORD", 3, 1, 1), element("COLOR", 3, 0, 1)];
+        let part = container::signature(&e, true);
+        let row = |i: usize| u32::from_le_bytes(part[8 + 32 * i + 4..8 + 32 * i + 8].try_into().unwrap());
+        // Each row's name offset: element 0's name comes first.
+        assert!(row(0) < row(1), "element order kept");
+    }
+
+    #[test]
+    fn early_depth_only_when_the_marks_are_the_only_writes() {
+        assert!(marked(true).early_depth_safe());
+        assert!(!marked(false).early_depth_safe(), "not a pixel shader");
+        let mut s = marked(true);
+        let one = s.m.i32(1);
+        let (b, i32t) = (s.entry, s.t.i32);
+        let faults = s.root_uav_handle(SLOT_READS);
+        let iu = s.m.undef(i32t);
+        s.op(b, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[faults, one, one, iu, iu, one]);
+        assert!(!s.early_depth_safe(), "a write of the title's own");
+        let mut s = marked(true);
+        let (b, void, i1) = (s.entry, s.t.void, s.t.i1);
+        let t = s.m.int_const(i1, 1);
+        s.op(b, "discard", Attr::NoUnwind, void, 82, &[t]);
+        assert!(!s.early_depth_safe(), "a discard");
     }
 }

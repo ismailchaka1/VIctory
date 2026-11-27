@@ -105,6 +105,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .get_or_insert_with(HashMap::new)
         .entry(*full.as_bytes())
         .or_insert_with(|| {
+            #[cfg(all(windows, feature = "diagnostics"))]
+            probe_match(stage, &full.to_hex()[..16], bytes);
             KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
             Arc::new(Shader {
@@ -116,6 +118,42 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
             })
         })
         .clone()
+}
+
+/// Hash-like words of device methods 0x1c8/0x218's descriptions, with the
+/// call that passed them (diagnostics, `device::dump_pieces`).
+#[cfg(all(windows, feature = "diagnostics"))]
+static PROBED: Mutex<Vec<(u64, usize, u32)>> = Mutex::new(Vec::new());
+
+/// Records `hashes` and logs every container seen so far that holds one.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn probe_hashes(slot: usize, call: u32, hashes: &[u64]) {
+    PROBED.lock().unwrap_or_else(|e| e.into_inner()).extend(hashes.iter().map(|&h| (h, slot, call)));
+    let shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
+    for s in shaders.iter().flat_map(|m| m.values()) {
+        for &h in hashes {
+            if let Some(at) = find8(&s.container, h) {
+                tracing::warn!(slot = format_args!("{slot:#x}"), call, hash = format_args!("{h:x}"), stage = s.stage, container = %s.hash, at, "probe: a 0x1c8/0x218 hash is in a container");
+            }
+        }
+    }
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn probe_match(stage: &str, name: &str, bytes: &[u8]) {
+    let probed = PROBED.lock().unwrap_or_else(|e| e.into_inner());
+    for &(h, slot, call) in probed.iter() {
+        if let Some(at) = find8(bytes, h) {
+            tracing::warn!(slot = format_args!("{slot:#x}"), call, hash = format_args!("{h:x}"), stage, container = name, at, "probe: a 0x1c8/0x218 hash is in a container");
+        }
+    }
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn find8(bytes: &[u8], h: u64) -> Option<usize> {
+    let le = h.to_le_bytes();
+    let be = h.to_be_bytes();
+    bytes.windows(8).position(|w| w == le || w == be)
 }
 
 /// A translated shader and the console resources its code reads.
@@ -257,16 +295,125 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
 /// shortcut: not a way to run: the title also reads results back (sizes,
 /// counters) and gets none, and a copy's pages are overwritten from title
 /// memory when the title writes them.
+/// A comma-separated list of shader hashes instead of `1` quarantines only
+/// those stages: to find, by halves, the stage that stores where it should
+/// not (the others read the quarantined results from the host's copies).
 #[cfg(windows)]
 pub(crate) fn builder_quarantined(this: This) -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    is_builder(this) && *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1"))
+    static LIST: OnceLock<Option<Vec<String>>> = OnceLock::new();
+    let Some(list) = LIST.get_or_init(|| {
+        let v = std::env::var("VICTORY_BVH_QUARANTINE").ok()?;
+        Some(v.split(',').map(|h| h.trim().to_ascii_lowercase()).collect())
+    }) else {
+        return false;
+    };
+    is_builder(this)
+        && (list.iter().any(|h| h == "1")
+            || pipeline(this).shaders.iter().any(|s| list.contains(&s.hash.to_string())))
+}
+
+/// Diagnostics: whether `this` holds the shader named by `VICTORY_WATCH_STAGE`
+/// (`builder`: every stage of the ray-tracing structure builder).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn watched_stage(this: This) -> bool {
+    static HASH: OnceLock<Option<String>> = OnceLock::new();
+    let Some(h) = HASH.get_or_init(|| std::env::var("VICTORY_WATCH_STAGE").ok()) else {
+        return false;
+    };
+    if h == "builder" {
+        return is_builder(this);
+    }
+    !this.is_null() && pipeline(this).shaders.iter().any(|s| s.hash.to_string() == *h)
 }
 
 /// Whether the title's pipeline `this` is one of the structure builder's.
 #[cfg(windows)]
 pub(crate) fn is_builder(this: This) -> bool {
     !this.is_null() && pipeline(this).builder
+}
+
+/// The console thread-group size of compute pipeline `this`.
+#[cfg(windows)]
+pub(crate) fn group_threads(this: This) -> Option<[u32; 3]> {
+    if this.is_null() {
+        return None;
+    }
+    let [shader] = &pipeline(this).shaders[..] else { return None };
+    static SIZES: Mutex<Option<HashMap<String, Option<[u32; 3]>>>> = Mutex::new(None);
+    let mut sizes = SIZES.lock().unwrap_or_else(|e| e.into_inner());
+    *sizes.get_or_insert_with(HashMap::new).entry(shader.hash.clone()).or_insert_with(|| {
+        use victory_shader::{Container, FourCC};
+        let c = Container::parse(&shader.container).ok()?;
+        let programs = victory_shader::native_programs(c.part(FourCC::DXIL)?.data).ok()?;
+        programs.iter().find_map(|p| match p.io {
+            victory_shader::native::StageIo::Cs(cs) if p.stage == victory_shader::HwStage::Cs => Some(cs.threads),
+            _ => None,
+        })
+    })
+}
+
+/// The host pipeline of compute pipeline `this` as the partial last group of a dispatch
+/// counted in threads: `threads` threads in x, its group given at the dispatch
+/// (`victory_shader::emit::translate`'s tail). Kept for the run. The first one a stage needs
+/// queues every other size of its group for a background thread; one not made yet is made
+/// here (or waited for, if the background thread is making it): a tail is never skipped.
+#[cfg(windows)]
+pub(crate) fn tail_pipeline(this: This, threads: u32) -> Option<&'static host::HostPipeline> {
+    let [shader] = &pipeline(this).shaders[..] else { return None };
+    if let Some([gx, ..]) = group_threads(this) {
+        make_tails_ahead(shader, gx);
+    }
+    *tail_slot(shader, threads).get_or_init(|| make_tail(shader, threads))
+}
+
+/// One tail's host pipeline: made once, by whichever thread asks first.
+#[cfg(windows)]
+type TailSlot = Arc<OnceLock<Option<&'static host::HostPipeline>>>;
+
+#[cfg(windows)]
+fn tail_slot(shader: &Shader, threads: u32) -> TailSlot {
+    static TAILS: Mutex<Option<HashMap<(String, u32), TailSlot>>> = Mutex::new(None);
+    TAILS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .entry((shader.hash.clone(), threads))
+        .or_default()
+        .clone()
+}
+
+/// Every tail size of `shader`'s group but whole, made on a background thread (once per stage).
+#[cfg(windows)]
+fn make_tails_ahead(shader: &Arc<Shader>, group: u32) {
+    static STARTED: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+    if !STARTED.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(shader.hash.clone()) {
+        return;
+    }
+    let shader = shader.clone();
+    let _ = std::thread::Builder::new().name("victory-tails".into()).spawn(move || {
+        for threads in 1..group {
+            tail_slot(&shader, threads).get_or_init(|| make_tail(&shader, threads));
+        }
+    });
+}
+
+#[cfg(windows)]
+fn make_tail(shader: &Shader, threads: u32) -> Option<&'static host::HostPipeline> {
+    let total = u32::from_le_bytes(shader.container.get(0x18..0x1C)?.try_into().ok()?) as usize;
+    let mut container = shader.container.get(..total)?.to_vec();
+    container.extend_from_slice(&victory_shader::emit::TAIL);
+    container.extend_from_slice(&threads.to_le_bytes());
+    let tail = Arc::new(Shader {
+        stage: shader.stage,
+        hash: format!("{}+{threads}", shader.hash),
+        container,
+        translated: OnceLock::new(),
+    });
+    let made = host::HostPipeline::new(&[tail], None).map(|p| &*Box::leak(Box::new(p)));
+    if made.is_none() {
+        tracing::warn!(hash = %shader.hash, threads, "no host pipeline for the partial last group of a dispatch counted in threads");
+    }
+    made
 }
 
 /// A stage of the builder was dropped after all: none runs from here on.
@@ -309,6 +456,8 @@ pub(crate) fn builder_runs() -> bool {
         "the ray-tracing structure builder runs: all of its programs have host pipelines"
     );
     b.whole = true;
+    #[cfg(feature = "diagnostics")]
+    crate::capture::builder_starts();
     true
 }
 
@@ -513,6 +662,7 @@ fn hand_out(
         let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
         b.pipelines.push(host.clone());
         b.whole = false;
+        tracing::info!(stage = b.pipelines.len(), hash = %shaders[0].hash, "a pipeline of the ray-tracing structure builder");
     }
     let pipeline = Box::new(Pipeline {
         object: Object::new(&FUNCTIONS),

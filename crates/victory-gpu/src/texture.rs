@@ -26,7 +26,16 @@ use crate::object::This;
 macro_rules! once {
     ($($arg:tt)*) => {{
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::warn!($($arg)*));
+        // Diagnostics: every time counted (`crate::census`).
+        #[cfg(feature = "diagnostics")]
+        static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        #[cfg(feature = "diagnostics")]
+        COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ONCE.call_once(|| {
+            #[cfg(feature = "diagnostics")]
+            crate::census::register(&COUNT, file!(), line!());
+            tracing::warn!($($arg)*)
+        });
     }};
 }
 
@@ -56,6 +65,8 @@ pub(crate) struct Staging {
     uploaded: std::sync::atomic::AtomicBool,
     /// When a list last recorded a use of it (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
+    /// The size class its buffer came from ([`pooled_upload`]); 0: not pooled.
+    class: u64,
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -293,7 +304,8 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 /// of it (1,345 of 1,381 ms; 3,630 of 3,708; the write-watch askings 3-12
 /// ms, the texture's own lock 0).
 ///
-/// With the switch the refresh asks for the lock without waiting. If the
+/// On by default since run-fork6 (`VICTORY_TEXTURE_NO_WAIT=0` waits as
+/// before), the refresh asks for the lock without waiting. If the
 /// runtime has it, the texture is read through the kernel instead, which
 /// needs no lock: it fails if a page is not there, and then the texture is
 /// left as it is and read at its next refresh, a frame later. A read
@@ -303,7 +315,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 /// is remapping may show a frame later. It never shows partly read.
 fn no_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_none_or(|v| v != "0"))
 }
 
 /// Since the last frame-rate line, with [`no_wait`]: refreshes that read
@@ -387,7 +399,59 @@ impl Drop for Staging {
         use std::sync::atomic::Ordering::Relaxed;
         STAGED[0].fetch_sub(1, Relaxed);
         STAGED[1].fetch_sub(self.bytes, Relaxed);
+        // The last holder let go: no list that records its copy is still to
+        // run (lists hold it until they are reset), so the buffer is free.
+        if self.class != 0 && POOL_BYTES.load(Relaxed) + self.class <= pool_cap() {
+            POOL_BYTES.fetch_add(self.class, Relaxed);
+            POOL.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_or_insert_with(HashMap::new)
+                .entry(self.class)
+                .or_default()
+                .push((self.buffer.clone(), self.data as usize));
+        }
     }
+}
+
+/// Staging buffers let go, by size class (a power of two, 64 KiB at least),
+/// with their mappings: the next staging of that class takes one instead
+/// of a new upload buffer. While the world streams in, a staging buffer is
+/// made for each texture picked by index and let go once its list has run:
+/// those creations were 17.7 s of the 39 s the texture pass took in
+/// run-fork14 (`CreateCommittedResource` on an upload heap, whose pages
+/// the system hands over zeroed).
+static POOL: Mutex<Option<HashMap<u64, Vec<(ID3D12Resource, usize)>>>> = Mutex::new(None);
+static POOL_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Since the start: stagings served from the pool, and made new.
+pub(crate) static POOL_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// The bytes the pool keeps at most (`VICTORY_STAGING_POOL_MB`, 1024; 0: no
+/// pool, every staging buffer made new as before).
+fn pool_cap() -> u64 {
+    static MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MB.get_or_init(|| std::env::var("VICTORY_STAGING_POOL_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1024)) << 20
+}
+
+/// An upload buffer of `total` bytes at least, mapped, from the pool if one
+/// of its class is there (zeroed, as a new one is), else new; and its class.
+fn pooled_upload(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resource, *mut u8, u64)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    if pool_cap() == 0 {
+        let (buffer, data) = host.upload_buffer(total)?;
+        return Some((buffer, data, 0));
+    }
+    let class = total.max(64 << 10).next_power_of_two();
+    let taken = POOL.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|p| p.get_mut(&class)?.pop());
+    if let Some((buffer, data)) = taken {
+        POOL_BYTES.fetch_sub(class, Relaxed);
+        POOL_STATS[0].fetch_add(1, Relaxed);
+        // SAFETY: the buffer's own mapping, `class` bytes; no list uses it.
+        unsafe { std::ptr::write_bytes(data as *mut u8, 0, class as usize) };
+        return Some((buffer, data as *mut u8, class));
+    }
+    POOL_STATS[1].fetch_add(1, Relaxed);
+    let (buffer, data) = host.upload_buffer(class)?;
+    Some((buffer, data, class))
 }
 
 /// For the memory line: staging buffers alive, their bytes, and how many
@@ -1127,7 +1191,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             Some(&mut total),
         );
     }
-    let (buffer, data) = host.upload_buffer(total)?;
+    let (buffer, data, class) = pooled_upload(host, total)?;
     crate::host::name(&buffer, || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",
@@ -1152,9 +1216,41 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
+        class,
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::{POOL, POOL_BYTES, pooled_upload};
+    use std::collections::HashMap;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    /// A staging buffer given back (as `Staging`'s drop does) is the one the
+    /// next staging of its size class gets, zeroed; other sizes get their
+    /// own class.
+    #[test]
+    fn a_staging_buffer_given_back_is_taken_again_zeroed() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let (buffer, data, class) = pooled_upload(host, 100_000).expect("an upload buffer");
+        assert_eq!(class, 128 << 10);
+        // SAFETY: the buffer's own mapping, `class` bytes.
+        unsafe { std::ptr::write_bytes(data, 0xab, class as usize) };
+        POOL_BYTES.fetch_add(class, Relaxed);
+        POOL.lock().unwrap().get_or_insert_with(HashMap::new).entry(class).or_default().push((buffer.clone(), data as usize));
+        let (again, data2, class2) = pooled_upload(host, 70_000).expect("an upload buffer");
+        assert_eq!(class2, class);
+        assert_eq!(again, buffer, "the buffer given back is taken again");
+        // SAFETY: as above.
+        let bytes = unsafe { std::slice::from_raw_parts(data2, class as usize) };
+        assert!(bytes.iter().all(|&b| b == 0), "a buffer taken again is zeroed");
+        let (_, _, small) = pooled_upload(host, 10).expect("an upload buffer");
+        assert_eq!(small, 64 << 10);
+    }
 }
 
 #[cfg(test)]

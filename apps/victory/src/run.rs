@@ -101,7 +101,8 @@ pub fn run(
         show(name, dll.bind_imports(&with_dlls, policy)?);
     }
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
-    show(&exe_name, image.bind_imports(&with_dlls, policy)?);
+    let hooked = BvhHooked(&with_dlls);
+    show(&exe_name, image.bind_imports(&hooked, policy)?);
     if !execute {
         println!("not executing (pass --execute to start the title)");
         return Ok(());
@@ -341,4 +342,25 @@ mod tests {
 #[cfg(not(windows))]
 pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<()> {
     anyhow::bail!("running titles requires Windows")
+}
+
+
+/// `VICTORY_BVH_LOG=1`: the title's imports of its ray-tracing structure
+/// builder's exports bound to logging thunks (`victory_hle::bvh_hook`).
+struct BvhHooked<'a>(&'a dyn victory_loader::ImportResolver);
+
+impl victory_loader::ImportResolver for BvhHooked<'_> {
+    fn resolve(&self, dll: &str, symbol: &victory_pe::ImportSymbol) -> victory_loader::Resolution {
+        let found = self.0.resolve(dll, symbol);
+        #[cfg(windows)]
+        if victory_hle::bvh_hook::on()
+            && dll.eq_ignore_ascii_case("XboxBvhBuilder.dll")
+            && let victory_loader::Resolution::Found { address, provenance } = found
+            && let victory_pe::ImportSymbol::Name { name, .. } = symbol
+            && let Some(thunk) = victory_hle::bvh_hook::wrap(name, address)
+        {
+            return victory_loader::Resolution::Found { address: thunk, provenance };
+        }
+        found
+    }
 }

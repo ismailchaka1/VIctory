@@ -142,7 +142,10 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 /// Runs `f` with the host list and draw state of a title list, if there
 /// is a host GPU.
 #[cfg(windows)]
+#[track_caller]
 fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
+    #[cfg(feature = "diagnostics")]
+    let caller = std::panic::Location::caller();
     let Some(list) = host_list(this) else { return };
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
@@ -150,7 +153,7 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     let state = unsafe { &(*this.cast::<List>()).state };
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
     #[cfg(feature = "diagnostics")]
-    crate::copystat::recorded(started);
+    crate::copystat::recorded_at(started, caller.line());
 }
 
 /// The submission of `lists` has run: each gives its descriptor tables'
@@ -318,6 +321,7 @@ fn cut(this: This, wait: ValueWait) {
         list.gate.push(wait);
         return;
     };
+    crate::query::cut(current);
     current.close();
     static CUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if CUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
@@ -1313,11 +1317,37 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
     0
 }
 
-/// `DispatchX(x, y, z, flags)`: a dispatch with console flags, which the
-/// host has no use for (the ray-tracing builder dispatches this way).
-extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
+/// `DispatchX(x, y, z, flags)`: a dispatch with console flags (the
+/// ray-tracing builder dispatches this way). Each flags value is logged
+/// once; `VICTORY_DISPATCHX_BARRIER=1` puts an unordered access barrier on
+/// every resource before each, to find out whether the flags order the
+/// builder's stages.
+extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
     #[cfg(windows)]
-    state::dispatch(this, x, y, z);
+    {
+        static SEEN: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if !seen.contains(&flags) {
+            seen.push(flags);
+            tracing::info!(flags = format_args!("{flags:#x}"), x, y, z, "DispatchX flags seen");
+        }
+        drop(seen);
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ON.get_or_init(|| std::env::var_os("VICTORY_DISPATCHX_BARRIER").is_some_and(|v| v == "1"))
+            && let Some(list) = host_list(this)
+        {
+            use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+            // SAFETY: the same layout; no resource named.
+            let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+            // SAFETY: an open list.
+            unsafe { list.list.ResourceBarrier(&[barrier]) };
+        }
+        if flags & USE_THREAD_DIMENSIONS != 0 {
+            dispatch_threads(this, x, y, z);
+        } else {
+            state::dispatch(this, x, y, z);
+        }
+    }
     #[cfg(not(windows))]
     {
         let _ = (this, x, y, z);
@@ -1325,30 +1355,129 @@ extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
     }
 }
 
-/// `BeginQuery`/`EndQuery(heap, type, index)`: queries are answered when
-/// resolved.
-extern "system" fn query_mark(_: This, _heap: This, _kind: u32, _index: u32) {}
+/// `DISPATCH_INITIATOR.USE_THREAD_DIMENSIONS`: DispatchX's x, y and z count threads, not
+/// groups; the last group in x is partial (its missing threads do not run). The ray-tracing
+/// builder sizes its dispatches this way (run-vis-45: as groups, its node stages wrote up to 64
+/// times past their structures, over the next structure's head, and the title crashed).
+const USE_THREAD_DIMENSIONS: u32 = 0x20;
 
-/// `ResolveQueryData(heap, type, first, count, buffer, offset)`: writes
-/// each query's result into the buffer once the list has run. Timestamps
-/// (type 2) are the GPU clock then; occlusion counts (0) say a million
-/// samples passed and binary occlusion (1) visible, so nothing is culled
-/// by a query.
-/// shortcut: no query runs on the host GPU; results are plausible values,
-/// not measured ones (time spans come out as the submission's length).
+/// A dispatch of `x * y * z` threads: the whole groups, then x's partial last group as a
+/// dispatch of its own with a pipeline made for that many threads.
+#[cfg(windows)]
+fn dispatch_threads(this: This, x: u32, y: u32, z: u32) {
+    macro_rules! once {
+        ($($arg:tt)*) => {{
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            // Diagnostics: every time counted (`crate::census`).
+            #[cfg(feature = "diagnostics")]
+            static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            #[cfg(feature = "diagnostics")]
+            COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            ONCE.call_once(|| {
+                #[cfg(feature = "diagnostics")]
+                crate::census::register(&COUNT, file!(), line!());
+                tracing::warn!($($arg)*)
+            });
+        }};
+    }
+    let mut pipeline: This = std::ptr::null_mut();
+    with_state(this, |_, s| pipeline = s.title_pipeline());
+    // (a builder stage while the builder is off is dropped there: no tail made for it)
+    if crate::pipeline::is_builder(pipeline) && !crate::pipeline::builder_runs() {
+        state::dispatch(this, x, y, z);
+        return;
+    }
+    let Some([gx, gy, gz]) = crate::pipeline::group_threads(pipeline) else {
+        once!(x, y, z, "a dispatch counted in threads without a known group size: run as groups");
+        state::dispatch(this, x, y, z);
+        return;
+    };
+    let (whole, rest) = (x / gx, x % gx);
+    let (gy_n, gz_n) = (y.div_ceil(gy), z.div_ceil(gz));
+    if (y % gy != 0 || z % gz != 0) || (rest != 0 && gy_n * gz_n != 1) {
+        // shortcut: partial groups in y or z (or a partial x group beside more than one
+        // in y or z) run whole; the builder's are 1-D. Make tails 3-D if a title needs it.
+        once!(x, y, z, gx, gy, gz, "a dispatch counted in threads with partial y or z groups: run rounded up");
+        state::dispatch(this, x.div_ceil(gx), gy_n, gz_n);
+        return;
+    }
+    if whole > 0 {
+        state::dispatch(this, whole, gy_n, gz_n);
+    }
+    if rest > 0 {
+        match crate::pipeline::tail_pipeline(pipeline, rest) {
+            Some(tail) => with_state(this, |list, s| s.dispatch_on(list, 1, 1, 1, Some((tail, whole)))),
+            None => {
+                // (a dropped part of a builder stage is a dropped stage)
+                if crate::pipeline::is_builder(pipeline) {
+                    crate::pipeline::builder_off("the partial last group of a dispatch counted in threads has no pipeline");
+                }
+                once!(x, gx, "the partial last group of a dispatch counted in threads has no pipeline: dropped");
+            }
+        }
+    }
+}
+
+/// `BeginQuery(heap, type, index)`: on the host list, for the types that
+/// run there (`crate::query::mark`).
+extern "system" fn begin_query(this: This, heap: This, kind: u32, index: u32) {
+    #[cfg(feature = "diagnostics")]
+    query_census(0, kind, 1);
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        crate::query::mark(list, heap, kind, index, true);
+    }
+    #[cfg(not(windows))]
+    let _ = (this, heap, index);
+}
+
+/// `EndQuery(heap, type, index)`, as [`begin_query`].
+extern "system" fn end_query(this: This, heap: This, kind: u32, index: u32) {
+    #[cfg(feature = "diagnostics")]
+    query_census(0, kind, 1);
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        crate::query::mark(list, heap, kind, index, false);
+    }
+    #[cfg(not(windows))]
+    let _ = (this, heap, index);
+}
+
+/// Diagnostics: query marks (`what` 0) and resolves (1) by query type,
+/// logged at each power of two.
+#[cfg(feature = "diagnostics")]
+fn query_census(what: usize, kind: u32, count: u32) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: [[AtomicU64; 8]; 2] = [const { [const { AtomicU64::new(0) }; 8] }; 2];
+    let n = N[what][kind.min(7) as usize].fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::info!(what = ["mark", "resolve"][what], kind, n, count, "query census");
+    }
+}
+
+/// `ResolveQueryData(heap, type, first, count, buffer, offset)`: each
+/// query's result lands in the buffer once the list has run. Occlusion,
+/// binary occlusion and pipeline statistics queries that ran on the host
+/// are resolved there and read back (`crate::query::resolve`). The others
+/// get plausible values: timestamps (type 2) the GPU clock then, occlusion
+/// counts (0) a million samples, binary occlusion (1) visible, so nothing
+/// is culled by a query that did not run.
+/// shortcut: timestamps are not measured on the host GPU (time spans come
+/// out as the submission's length); the title's frequency is ours, and
+/// host ticks need a rescale after the read-back that `host.rs` does not
+/// offer yet.
 extern "system" fn resolve_queries(
     this: This,
-    _heap: This,
+    heap: This,
     kind: u32,
-    _first: u32,
+    first: u32,
     count: u32,
     buffer: This,
     offset: u64,
 ) {
-    const OCCLUSION: u32 = 0;
-    const BINARY: u32 = 1;
-    const TIMESTAMP: u32 = 2;
-    const PIPELINE_STATISTICS: u32 = 3;
+    use crate::query::{BINARY, OCCLUSION, PIPELINE_STATISTICS, TIMESTAMP};
+    #[cfg(feature = "diagnostics")]
+    query_census(1, kind, count);
     let Some((data, size)) = crate::resource::buffer_bytes(buffer) else {
         return;
     };
@@ -1362,11 +1491,26 @@ extern "system" fn resolve_queries(
     if offset + u64::from(count) * bytes > size {
         return;
     }
-    for i in 0..u64::from(count) {
+    // SAFETY: inside the buffer, checked above.
+    let dst = unsafe { data.add(offset as usize) };
+    #[cfg(windows)]
+    let plausible = host_list(this)
+        .and_then(|list| crate::query::resolve(list, heap, kind, first, count, dst, bytes))
+        .unwrap_or_else(|| vec![(first, count)]);
+    #[cfg(not(windows))]
+    let plausible = [(first, count)];
+    for (start, n) in plausible {
+        resolve_plausible(this, dst, u64::from(start - first), n, what, bytes);
+    }
+}
+
+/// Plausible results for queries `at..at + count` of a resolve into `dst`.
+fn resolve_plausible(this: This, dst: *mut u8, at: u64, count: u32, what: Written, bytes: u64) {
+    for i in at..at + u64::from(count) {
         // Wider results are written as 8-byte pieces.
         for piece in 0..bytes / 8 {
-            // SAFETY: inside the buffer, checked above.
-            let at = unsafe { data.add((offset + i * bytes + piece * 8) as usize) };
+            // SAFETY: inside the buffer, checked by the caller.
+            let at = unsafe { dst.add((i * bytes + piece * 8) as usize) };
             let what = if piece == 0 { what } else { Written::Value(0) };
             defer_write(this, at as u64, what, 8);
         }
@@ -1393,10 +1537,31 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
 }
 
 /// Pipeline syncs: waits for earlier work and cache flushes, at the top or
-/// bottom of the pipe `(flags, control, address, size)`. Host lists order
-/// their own work and every submission is waited for, so there is nothing
-/// to do.
-extern "system" fn sync(_: This, _flags: u32, _control: u32, _address: u64, _size: u64) {}
+/// bottom of the pipe `(flags, control, address, size)`. A host list may
+/// overlap a dispatch with the one before it and need not show it that
+/// one's writes, so each sync is an unordered access barrier on every
+/// resource, as the title's barriers are (`barrier_groups`).
+/// `VICTORY_SYNC_BARRIER=0`: nothing, as before.
+extern "system" fn sync(this: This, flags: u32, control: u32, _address: u64, _size: u64) {
+    #[cfg(windows)]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_SYNC_BARRIER").is_none_or(|v| v != "0")) {
+            return;
+        }
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| tracing::info!(flags = format_args!("{flags:#x}"), control = format_args!("{control:#x}"), "a pipeline sync: an unordered access barrier on every resource"));
+        if let Some(list) = host_list(this) {
+            use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+            // SAFETY: the same layout; no resource named.
+            let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+            // SAFETY: an open list.
+            unsafe { list.list.ResourceBarrier(&[barrier]) };
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (this, flags, control);
+}
 
 /// Reset with console flags `(allocator, pipeline, flags)`; the flags only
 /// tune the console's command memory.
@@ -2103,8 +2268,8 @@ const METHODS: [(usize, *const ()); 52] = [
 ];
 /// The rest of [`METHODS`], kept apart only to stay readable.
 const MORE_METHODS: [(usize, *const ()); 9] = [
-    (28, query_mark as *const ()),             // 0xe0 BeginQuery
-    (29, query_mark as *const ()),             // 0xe8 EndQuery
+    (28, begin_query as *const ()),            // 0xe0 BeginQuery
+    (29, end_query as *const ()),              // 0xe8 EndQuery
     (30, resolve_queries as *const ()),        // 0xf0
     (78, dispatch_x as *const ()),             // 0x270
     (98, state::dispatch_mesh_x as *const ()), // 0x310
